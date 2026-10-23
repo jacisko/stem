@@ -27,7 +27,8 @@ vi.mock('../../src/desktop/platform', () => ({
   presentOverlayWindow: () => { mock.overlay.visible = true; }, quickChatSummonCommand: () => 'stem'
 }));
 vi.mock('../../src/desktop/ipc-bridge', () => ({
-  handleLocal: (name: string, fn: (...args: unknown[]) => unknown) => mock.handlers.set(name, fn)
+  handleLocal: (name: string, fn: (...args: unknown[]) => unknown) => mock.handlers.set(name, fn),
+  handleLocalFrom: (name: string, fn: (...args: unknown[]) => unknown) => mock.handlers.set(name, fn)
 }));
 
 import { createQuickChat } from '../../src/desktop/quickchat';
