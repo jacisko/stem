@@ -2,8 +2,11 @@ import { execFile, spawn } from 'node:child_process';
 import { existsSync, readdirSync, readlinkSync } from 'node:fs';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmod, mkdir, realpath, rm } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import { createServer, type Server, type Socket } from 'node:net';
-import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import { log } from '../../server/log';
 import {
   encodeFrame,
@@ -15,7 +18,8 @@ import {
   type FromExtension,
   type HostHello,
   type ToExtension,
-  launchableBrowser
+  launchableBrowser,
+  sandboxOf
 } from '../../shared/browser-native';
 import type {
   BrowserDownloadReceipt,
@@ -25,18 +29,24 @@ import type {
   DeviceBrowserResult
 } from '../../shared/types';
 import {
+  browserDirs,
   browserInstallPaths,
   ensureHostConfig,
   extensionsPageUrl,
+  hasSandboxedBrowsers,
   installBrowserControl,
+  newRelayPort,
   refreshBrowserControl,
+  relaysHere,
   setupBrowsers,
+  writeHostConfig,
   type BrowserHostConfig,
   type BrowserInstallPaths,
   type InstallSource
 } from './install';
 import { handshakeProof, isNonce, newNonce, proofMatches } from './handshake';
 import { launchableAppImage } from './appimage';
+import { inSandboxDir, openDownload, removeInSandbox, parseRelayHello, relayKey, sandboxCommand, sandboxRoot, sandboxRunning } from './relay';
 import { arcSidebarText, readArcSidebar, type ArcSidebarTab } from './arc-tabs';
 import {
   appOf,
@@ -54,7 +64,9 @@ import {
 // The extension reaches us through its native-messaging host, which the
 // browser starts and which connects to a unix socket here (0600, in this
 // profile's state folder; a named pipe on Windows) and proves it holds the
-// token from the config Set up wrote (handshake.ts). One connection per
+// token from the config Set up wrote (handshake.ts). A Snap or Flatpak
+// browser's host is a relay inside its sandbox instead, which reaches a
+// loopback TCP port here with the same proof in text lines (relay.ts). One connection per
 // browser profile — the extension sends an id it keeps in that profile's
 // storage — and several may be up at once (Arc's work and personal profiles,
 // Chrome beside them). The user picks the default and can name each one; the
@@ -144,6 +156,12 @@ interface Conn {
   appName: string;
   version?: string;
   pending: Map<string, (result: ExtensionResult) => void>;
+  /**
+   * A sandboxed browser's relay (relay.ts), by its id: an upload's files go to
+   * its own folder for the browser to read them, and its downloads are copied
+   * here, since the relay cannot.
+   */
+  sandbox?: string;
 }
 
 /** Longest name a profile may be given. */
@@ -279,6 +297,11 @@ function runningWindowsExe(exe: string): Promise<boolean> {
 }
 
 async function defaultLaunch(appPath: string, platform: NodeJS.Platform): Promise<void> {
+  const sandboxed = platform === 'linux' ? sandboxCommand(appPath, []) : null;
+  if (sandboxed) {
+    if (await sandboxRunning(appPath)) return;
+    return spawnDetached(sandboxed.command, sandboxed.args);
+  }
   if (platform === 'win32') {
     // As on Linux: a second start of a running browser opens a window.
     if (await runningWindowsExe(appPath)) return;
@@ -299,7 +322,11 @@ async function defaultLaunch(appPath: string, platform: NodeJS.Platform): Promis
 
 function defaultOpenWith(appPath: string | null, target: string, platform: NodeJS.Platform): Promise<void> {
   if (platform === 'win32') return appPath ? spawnDetached(appPath, [target]) : spawnDetached('explorer.exe', [target]);
-  if (platform === 'linux') return appPath ? spawnDetached(appPath, [target]) : spawnDetached('xdg-open', [target]);
+  if (platform === 'linux') {
+    const sandboxed = appPath ? sandboxCommand(appPath, [target]) : null;
+    if (sandboxed) return spawnDetached(sandboxed.command, sandboxed.args);
+    return appPath ? spawnDetached(appPath, [target]) : spawnDetached('xdg-open', [target]);
+  }
   return new Promise((resolve, reject) => {
     execFile('/usr/bin/open', appPath ? ['-a', appPath, target] : [target], (error) =>
       error ? reject(error) : resolve()
@@ -347,9 +374,13 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
   const connectWaiters = new Set<() => void>();
   /** Upload folders per thread, removed when the run ends. */
   const uploadDirs = new Map<string, Set<string>>();
+  /** The same in sandboxed browsers' folders, by browser and folder name: removed through the held-open folder. */
+  const sandboxUploads = new Map<string, Array<{ app: string; name: string }>>();
   /** The profile each live thread last named (KnownBrowser.id), until its run ends. */
   const threadProfile = new Map<string, string>();
   let server: Server | null = null;
+  /** Loopback, for sandboxed browsers' relays; up only while one is set up for this profile. */
+  let relayServer: Server | null = null;
   let config: BrowserHostConfig | null = null;
   /**
    * Browsers that may still run extension code older than the files on disk:
@@ -479,7 +510,13 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
       const settle = conn.pending.get(message.id);
       if (settle) {
         conn.pending.delete(message.id);
-        settle(message.result);
+        const r = message.result;
+        // A relay cannot copy downloads to the spool as the Node host does.
+        if (conn.sandbox && r.ok && r.downloads?.length) {
+          void spoolDownloads(r.downloads).then((downloads) => settle({ ...r, downloads }));
+        } else {
+          settle(r);
+        }
       }
       return;
     }
@@ -488,6 +525,147 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
         .invoke('browserHost:event', [{ threadId: message.threadId, kind: 'stopped' }])
         .catch(() => undefined);
     }
+  }
+
+  /**
+   * Copy a sandboxed browser's finished downloads into the spool
+   * (native-host-main.ts does this for an unsandboxed one). Only plain files
+   * inside the Downloads folder (relay.ts openDownload): the path is the
+   * sandbox's word, and this side reads with all the user's rights.
+   */
+  async function spoolDownloads(downloads: ExtensionDownload[]): Promise<ExtensionDownload[]> {
+    const out: ExtensionDownload[] = [];
+    for (const d of downloads) {
+      try {
+        const handle = await openDownload(typeof d.path === 'string' ? d.path : '', deps.home);
+        const dir = join(paths.spoolDir, randomBytes(8).toString('hex'));
+        try {
+          await mkdir(dir, { recursive: true, mode: 0o700 });
+          const to = join(dir, basename(d.name || d.path) || 'download');
+          await pipeline(handle.createReadStream(), createWriteStream(to, { flags: 'wx', mode: 0o600 }));
+          out.push({ ...d, path: to });
+        } finally {
+          await handle.close().catch(() => undefined);
+        }
+      } catch (e) {
+        log('browser-host', 'could not spool a download', { error: e instanceof Error ? e.message : String(e) });
+        // Left as it was: remoteResult sends up only spool copies.
+        out.push(d);
+      }
+    }
+    return out;
+  }
+
+  /** The connection's frames after its handshake: the extension's messages, and a closed socket ending its actions. */
+  function serve(socket: Socket, conn: Conn, reader: FrameReader, rest?: Buffer): void {
+    const take = (chunk: Buffer): void => {
+      let bodies: Buffer[];
+      try {
+        bodies = reader.push(chunk);
+      } catch {
+        socket.destroy();
+        return;
+      }
+      for (const body of bodies) {
+        try {
+          onFrame(conn, JSON.parse(body.toString('utf8')) as FromExtension);
+        } catch {
+          // Not JSON: dropped.
+        }
+      }
+    };
+    socket.on('data', take);
+    if (rest?.length) take(rest);
+  }
+
+  function dropConn(conn: Conn): void {
+    for (const settle of conn.pending.values()) {
+      settle({
+        ok: false,
+        error:
+          `${conn.appName} disconnected from Stem during the action (it quit, or the extension reloaded). ` +
+          'The action may or may not have happened: check the page before repeating it.'
+      });
+    }
+    conn.pending.clear();
+    if (conn.key && conns.get(conn.key) === conn) {
+      conns.delete(conn.key);
+      void announce();
+    }
+  }
+
+  /**
+   * A sandboxed browser's relay (relay.ts) on the loopback port. Anyone on
+   * this computer can reach the port, so nothing is accepted before the relay
+   * proves it holds the token, and only for a Snap or Flatpak browser that is
+   * set up here — Stem names it, not the relay.
+   */
+  function acceptRelay(socket: Socket): void {
+    let text = '';
+    let nonce: string | null = null;
+    let claimed: { appPath: string; appName: string; key: string } | null = null;
+    const timer = setTimeout(() => socket.destroy(), 10_000);
+    timer.unref?.();
+    socket.on('error', () => undefined);
+    const onText = (chunk: Buffer): void => {
+      text += chunk.toString('latin1');
+      for (let at = text.indexOf('\n'); at >= 0 && !socket.destroyed; at = text.indexOf('\n')) {
+        const line = text.slice(0, at);
+        text = text.slice(at + 1);
+        if (!nonce) {
+          const hello = parseRelayHello(line);
+          const dir = hello ? browserDirs(deps.home ?? homedir(), platform).find((d) => d.sandbox === hello.app) : undefined;
+          if (!hello || !dir || !config) {
+            log('browser-host', 'refused a relay that did not start the handshake for a browser set up here');
+            socket.destroy();
+            return;
+          }
+          // That browser's own key: a relay can prove only the browser it was written for.
+          claimed = { appPath: hello.app, appName: dir.name, key: relayKey(config.relaySecret, hello.app) };
+          nonce = newNonce();
+          socket.write(`${nonce} ${handshakeProof(claimed.key, 'stem', hello.nonce)}\n`);
+          continue;
+        }
+        if (!claimed || !proofMatches(claimed.key, 'host', nonce, line.trim())) {
+          log('browser-host', 'refused a relay without the right token');
+          socket.destroy();
+          return;
+        }
+        clearTimeout(timer);
+        socket.off('data', onText);
+        const conn: Conn = { socket, key: null, appPath: claimed.appPath, appName: claimed.appName, pending: new Map(), sandbox: claimed.appPath };
+        socket.on('close', () => dropConn(conn));
+        // What the Node host tells the extension once it reaches Stem.
+        send(conn, { type: 'host', connected: true });
+        // Which profile this is arrives with the extension's hello, right behind.
+        serve(socket, conn, new FrameReader(), Buffer.from(text, 'latin1'));
+        return;
+      }
+      if (text.length > 1024) socket.destroy();
+    };
+    socket.on('data', onText);
+    socket.on('close', () => clearTimeout(timer));
+  }
+
+  /** Listen on loopback for relays, on the config's port, or a new one when another program has it. */
+  async function listenRelay(): Promise<void> {
+    if (platform !== 'linux' || relayServer) return;
+    config = config ?? (await ensureHostConfig(paths));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const s = createServer(acceptRelay);
+      const ok = await new Promise<boolean>((resolve) => {
+        s.once('error', () => resolve(false));
+        s.listen(config!.relayPort, '127.0.0.1', () => resolve(true));
+      });
+      if (ok) {
+        s.on('error', (e) => log('browser-host', 'relay port error', { error: String(e) }));
+        relayServer = s;
+        return;
+      }
+      log('browser-host', 'the relay port is taken; moving to another', { port: config.relayPort });
+      config = await writeHostConfig(paths, { ...config, relayPort: newRelayPort() });
+    }
+    throw new Error('no free port for sandboxed browsers');
   }
 
   function accept(socket: Socket): void {
@@ -561,20 +739,7 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
     socket.on('error', () => undefined);
     socket.on('close', () => {
       clearTimeout(hello);
-      if (!conn) return;
-      for (const settle of conn.pending.values()) {
-        settle({
-          ok: false,
-          error:
-            `${conn.appName} disconnected from Stem during the action (it quit, or the extension reloaded). ` +
-            'The action may or may not have happened: check the page before repeating it.'
-        });
-      }
-      conn.pending.clear();
-      if (conn.key && conns.get(conn.key) === conn) {
-        conns.delete(conn.key);
-        void announce();
-      }
+      if (conn) dropConn(conn);
     });
   }
 
@@ -785,19 +950,38 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
   }
 
   /** The device's action, as the extension takes it: an upload's files fetched to this Mac first. */
-  async function localAction(request: DeviceBrowserRequest): Promise<ExtensionAction> {
+  async function localAction(request: DeviceBrowserRequest, conn: Conn): Promise<ExtensionAction> {
     const action = request.action;
     if (action.kind !== 'upload') return action;
-    // A folder name of our own, never one built from what came over the wire.
-    const dir = join(paths.uploadsDir, randomBytes(8).toString('hex'));
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    const dirs = uploadDirs.get(request.threadId) ?? new Set<string>();
-    dirs.add(dir);
-    uploadDirs.set(request.threadId, dirs);
-    const local: string[] = [];
     for (const f of action.files) {
       if (typeof f.id !== 'string' || !/^[0-9a-f]{32}$/.test(f.id)) throw new Error('an upload named a file the server never queued');
-      local.push(await deps.downloadOutbox(f.id, dir, f.name));
+    }
+    // A folder name of our own, never one built from what came over the wire.
+    const name = randomBytes(8).toString('hex');
+    const fetchInto = async (dir: string) => {
+      const local: string[] = [];
+      for (const f of action.files) local.push(await deps.downloadOutbox(f.id, dir, f.name));
+      return local;
+    };
+    let local: string[];
+    if (conn.sandbox) {
+      // The sandboxed browser's own folder, which it can read — and write:
+      // the folder is held open while the files land (relay.ts sandboxDir),
+      // each created fresh (O_EXCL), and the browser told the real path.
+      const app = conn.sandbox;
+      const list = sandboxUploads.get(request.threadId) ?? [];
+      list.push({ app, name });
+      sandboxUploads.set(request.threadId, list);
+      local = await inSandboxDir(app, deps.home ?? homedir(), ['uploads', name], async (dir) =>
+        (await fetchInto(dir.at)).map((p) => join(dir.real, basename(p)))
+      );
+    } else {
+      const dir = join(paths.uploadsDir, name);
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const dirs = uploadDirs.get(request.threadId) ?? new Set<string>();
+      dirs.add(dir);
+      uploadDirs.set(request.threadId, dirs);
+      local = await fetchInto(dir);
     }
     return { kind: 'upload', ref: action.ref, paths: local, ...(action.tab !== undefined ? { tab: action.tab } : {}) };
   }
@@ -885,7 +1069,7 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
     const conn = target.conn;
     let action: ExtensionAction;
     try {
-      action = await localAction(request);
+      action = await localAction(request, conn);
     } catch (e) {
       return { ok: false, error: `The files could not be brought to the ${here} for the upload: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -905,6 +1089,7 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
 
   async function refreshInstall(): Promise<void> {
     try {
+      if (relaysHere(paths, deps.home, platform).length) await listenRelay();
       const refreshed = await refreshBrowserControl(deps.installSource(), paths, deps.home, platform);
       if (refreshed?.extensionChanged) {
         await oweReload();
@@ -961,6 +1146,12 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
       for (const c of conns.values()) send(c, { type: 'end', threadId });
       for (const dir of uploadDirs.get(threadId) ?? []) void rm(dir, { recursive: true, force: true });
       uploadDirs.delete(threadId);
+      for (const { app, name } of sandboxUploads.get(threadId) ?? []) {
+        void inSandboxDir(app, deps.home ?? homedir(), ['uploads'], (dir) => removeInSandbox(dir.at, name)).catch(
+          () => undefined
+        );
+      }
+      sandboxUploads.delete(threadId);
     },
 
     localState: state,
@@ -1018,6 +1209,10 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
     async setUp() {
       if (!supported) return state();
       await listen().catch((e) => log('browser-host', 'could not listen for the extension', { error: String(e) }));
+      if (hasSandboxedBrowsers(deps.home, platform)) {
+        // Before the relays are written: they carry the port.
+        await listenRelay().catch((e) => log('browser-host', 'could not listen for sandboxed browsers', { error: String(e) }));
+      }
       const result = await installBrowserControl(deps.installSource(), paths, deps.home, platform);
       log('browser-host', 'set up browser control', { registered: result.registered });
       if (result.extensionChanged) {
@@ -1030,18 +1225,21 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
       const settings = await readBrowserHostSettings();
       const known = browserId ?? defaultId(settings);
       const app = (known ? appOf(known) : null) ?? setupBrowsers(deps.home, platform)[0]?.app ?? null;
+      // A Snap or Flatpak browser loads its own copy, the one it can read.
+      const sandboxed = app && platform === 'linux' && sandboxOf(app) ? sandboxRoot(app, deps.home) : null;
+      const folder = sandboxed ? join(sandboxed, 'extension') : paths.extensionDir;
       // The path goes on the clipboard first, while Stem still has focus: Load
       // unpacked's picker takes it with ⌘⇧G (Ctrl+L in GTK's), which beats
       // hunting for a folder inside Application Support or ~/.config.
       try {
-        deps.copyText?.(paths.extensionDir);
+        deps.copyText?.(folder);
       } catch (e) {
         log('browser-host', 'could not copy the extension folder', { error: String(e) });
       }
       // Browsers refuse chrome:// URLs from outside, so the reliable half is
       // the folder: Finder (or the file manager) shows it, ready for Load unpacked. The browser still
       // comes forward, so typing its extensions page is all that is left.
-      await openWith(null, paths.extensionDir).catch(() => undefined);
+      await openWith(null, folder).catch(() => undefined);
       // The renderer names the app; on Linux that is a program to run, so only a known browser.
       if (app && mayLaunch(app)) {
         await openWith(app, extensionsPageUrl(app)).catch(() => undefined);
@@ -1067,6 +1265,8 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
       conns.clear();
       server?.close();
       server = null;
+      relayServer?.close();
+      relayServer = null;
       if (config && !isPipe(config.socketPath)) void rm(config.socketPath, { force: true });
     }
   };

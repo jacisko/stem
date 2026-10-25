@@ -1276,6 +1276,8 @@ function LoadUnpackedSteps({
   const [app, setApp] = useState<string | null>(null);
   const browser = browsers.find((b) => b.app === app) ?? browsers[0] ?? null;
   const url = browser?.extensionsUrl ?? 'chrome://extensions';
+  // A Snap or Flatpak browser cannot read the shared folder; it has its own copy.
+  const folder = browser?.extensionPath ?? extensionPath;
   return (
     <div className="set-vbody ext-steps">
       {browsers.length > 1 && (
@@ -1328,8 +1330,8 @@ function LoadUnpackedSteps({
             </>
           )}
           <div className="ext-line">
-            <code className="ext-path">{extensionPath}</code>
-            <CopyIcon text={extensionPath} label="Copy the folder’s path" />
+            <code className="ext-path">{folder}</code>
+            <CopyIcon text={folder} label="Copy the folder’s path" />
           </div>
         </li>
       </ol>

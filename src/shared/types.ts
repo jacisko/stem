@@ -2136,6 +2136,8 @@ export interface SetupBrowser {
   app: string;
   /** Its extensions page, to type into the address bar. */
   extensionsUrl: string;
+  /** A Snap or Flatpak browser's own copy of the extension, when it cannot read the shared one. */
+  extensionPath?: string;
 }
 
 // ---- Coding agents on the user's own devices (coding_agent's `device`) ----

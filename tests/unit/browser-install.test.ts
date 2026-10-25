@@ -13,13 +13,15 @@ import {
   installBrowserControl,
   installedHere,
   refreshBrowserControl,
+  relaysHere,
   setupBrowsers,
   socketPathFor,
   windowsRegistry,
   wrapperBatch,
   wrapperScript
 } from '../../src/desktop/browser-host/install';
-import { FrameReader, appImageName, encodeFrame, launchableBrowser, launchableOnLinux, windowsBrowserName } from '../../src/shared/browser-native';
+import { FrameReader, appImageName, encodeFrame, launchableBrowser, launchableOnLinux, sandboxOf, windowsBrowserName } from '../../src/shared/browser-native';
+import { parseRelayHello, relayKey, removeInSandbox } from '../../src/desktop/browser-host/relay';
 import { appImageOf, browserOf } from '../../src/desktop/browser-host/native-host-main';
 import { launchableAppImage } from '../../src/desktop/browser-host/appimage';
 import { expectPosixMode } from './posix-mode';
@@ -213,6 +215,159 @@ describe('Linux', () => {
     for (const bad of ['/home/u/bin/chrome', '/tmp/brave-evil.sh', '/opt/google/chrome/../../../tmp/x', '/usr/bin/vivaldi-bin', 'sh', '']) {
       expect(launchableOnLinux(bad)).toBe(false);
     }
+  });
+});
+
+describe('Snap and Flatpak', () => {
+  /** A Chromium user-data folder, as a browser leaves it. */
+  const browserData = (...p: string[]) => {
+    mkdirSync(join(home, ...p, 'Default'), { recursive: true });
+    writeFileSync(join(home, ...p, 'Local State'), '{}');
+    return join(home, ...p);
+  };
+
+  it('puts a relay and an extension copy in each sandboxed browser’s own folder', async () => {
+    const snap = browserData('snap', 'chromium', 'common', 'chromium');
+    const brave = browserData('snap', 'brave', 'current', '.config', 'BraveSoftware', 'Brave-Browser');
+    const flatpak = browserData('.var', 'app', 'com.google.Chrome', 'config', 'google-chrome');
+    // A sandboxed Electron app is no browser.
+    browserData('.var', 'app', 'com.slack.Slack', 'config', 'Slack');
+    writeFileSync(join(home, '.var', 'app', 'com.slack.Slack', 'config', 'Slack', 'Preferences'), '{}');
+    const paths = browserInstallPaths(state);
+    const res = await installBrowserControl(src(), paths, home, 'linux');
+    expect(res.registered.sort()).toEqual(['Brave (Snap)', 'Chromium (Snap)', 'Google Chrome (Flatpak)']);
+
+    const relay = join(home, 'snap', 'chromium', 'common', 'stem', 'stem-browser-host');
+    const manifest = JSON.parse(readFileSync(join(snap, 'NativeMessagingHosts', 'com.stem.browser.json'), 'utf8'));
+    expect(manifest).toMatchObject({ name: 'com.stem.browser', path: relay });
+    expect(JSON.parse(readFileSync(join(brave, 'NativeMessagingHosts', 'com.stem.browser.json'), 'utf8')).path).toBe(
+      join(home, 'snap', 'brave', 'common', 'stem', 'stem-browser-host')
+    );
+    const flatpakRelay = join(home, '.var', 'app', 'com.google.Chrome', 'data', 'stem', 'stem-browser-host');
+    expect(JSON.parse(readFileSync(join(flatpak, 'NativeMessagingHosts', 'com.stem.browser.json'), 'utf8')).path).toBe(flatpakRelay);
+    expect(existsSync(join(home, '.var', 'app', 'com.slack.Slack', 'config', 'Slack', 'NativeMessagingHosts'))).toBe(false);
+
+    const config = JSON.parse(readFileSync(paths.configPath, 'utf8'));
+    const script = readFileSync(relay, 'utf8');
+    expect(script).toMatch(/^#!\/bin\/bash\n/);
+    expect(script).toContain(`port=${config.relayPort}\n`);
+    // Its own key, not the profile's token: a sandboxed browser can read it.
+    expect(script).toContain(`token='${relayKey(config.relaySecret, 'snap:chromium')}'`);
+    expect(script).not.toContain(config.token);
+    expect(readFileSync(flatpakRelay, 'utf8')).toContain(`token='${relayKey(config.relaySecret, 'flatpak:com.google.Chrome')}'`);
+    expect(script).toContain("app='snap:chromium'");
+    expectPosixMode(relay, 0o700);
+    expect(existsSync(join(home, 'snap', 'chromium', 'common', 'stem', 'extension', 'background.js'))).toBe(true);
+    expect(installedHere(paths, home, 'linux')).toBe(true);
+    expect(relaysHere(paths, home, 'linux').sort()).toEqual(['flatpak:com.google.Chrome', 'snap:brave', 'snap:chromium']);
+  });
+
+  it('refreshes relays only for the profile that wrote them, with the port the config has now', async () => {
+    browserData('snap', 'chromium', 'common', 'chromium');
+    const other = mkdtempSync(join(tmpdir(), 'stem-other-'));
+    await installBrowserControl(src(), browserInstallPaths(other), home, 'linux');
+    const mine = browserInstallPaths(state);
+    expect(relaysHere(mine, home, 'linux')).toEqual([]);
+    expect(await refreshBrowserControl(src(), mine, home, 'linux')).toBeNull();
+    rmSync(other, { recursive: true, force: true });
+
+    await installBrowserControl(src(), mine, home, 'linux');
+    const config = JSON.parse(readFileSync(mine.configPath, 'utf8'));
+    writeFileSync(mine.configPath, JSON.stringify({ ...config, relayPort: 23456 }));
+    writeFileSync(join(ext, 'background.js'), '// v2');
+    expect((await refreshBrowserControl(src(), mine, home, 'linux'))?.extensionChanged).toBe(true);
+    const root = join(home, 'snap', 'chromium', 'common', 'stem');
+    expect(readFileSync(join(root, 'stem-browser-host'), 'utf8')).toContain('port=23456\n');
+    expect(readFileSync(join(root, 'extension', 'background.js'), 'utf8')).toBe('// v2');
+  });
+
+  it.skipIf(process.platform === 'win32')('never writes through a link the sandboxed browser planted in its folder', async () => {
+    browserData('snap', 'chromium', 'common', 'chromium');
+    const target = join(home, 'precious');
+    mkdirSync(target);
+    // The snap may write anywhere under common/: it points Stem's folder elsewhere.
+    symlinkSync(target, join(home, 'snap', 'chromium', 'common', 'stem'));
+    await expect(installBrowserControl(src(), browserInstallPaths(state), home, 'linux')).rejects.toThrow(/not a folder of this user/);
+    expect(existsSync(join(target, 'stem-browser-host'))).toBe(false);
+    rmSync(join(home, 'snap', 'chromium', 'common', 'stem'));
+
+    // Or the relay file or the extension folder.
+    const root = join(home, 'snap', 'chromium', 'common', 'stem');
+    mkdirSync(root);
+    const victim = join(home, 'victim.txt');
+    writeFileSync(victim, 'KEEP');
+    symlinkSync(victim, join(root, 'stem-browser-host'));
+    symlinkSync(target, join(root, 'extension'));
+    await installBrowserControl(src(), browserInstallPaths(state), home, 'linux');
+    expect(readFileSync(victim, 'utf8')).toBe('KEEP');
+    expect(readFileSync(join(root, 'stem-browser-host'), 'utf8')).toMatch(/^#!\/bin\/bash/);
+    expect(existsSync(join(target, 'background.js'))).toBe(false);
+    expect(existsSync(join(root, 'extension', 'background.js'))).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('deletes a tree in the browser’s folder without following the links in it', async () => {
+    const outside = join(home, 'outside');
+    mkdirSync(join(outside, 'keep'), { recursive: true });
+    writeFileSync(join(outside, 'keep', 'file'), 'KEEP');
+    const tree = join(home, 'tree');
+    mkdirSync(join(tree, 'a', 'b'), { recursive: true });
+    writeFileSync(join(tree, 'a', 'b', 'f'), 'x');
+    symlinkSync(outside, join(tree, 'a', 'link'));
+    symlinkSync(join(outside, 'keep', 'file'), join(tree, 'filelink'));
+    await removeInSandbox(home, 'tree');
+    expect(existsSync(tree)).toBe(false);
+    expect(readFileSync(join(outside, 'keep', 'file'), 'utf8')).toBe('KEEP');
+    // The thing to delete itself a link: only the link goes.
+    symlinkSync(outside, join(home, 'tree'));
+    await removeInSandbox(home, 'tree');
+    expect(existsSync(join(outside, 'keep', 'file'))).toBe(true);
+    await removeInSandbox(home, 'missing');
+  });
+
+  it('offers a sandboxed browser with its own extension folder only when Snap or Flatpak has its launcher', () => {
+    browserData('snap', 'chromium', 'common', 'chromium');
+    browserData('.var', 'app', 'org.chromium.Chromium', 'config', 'chromium');
+    const snapBin = join(home, 'sys', 'snap', 'bin');
+    const exports = join(home, 'sys', 'flatpak', 'exports', 'bin');
+    const path = join(home, 'bin');
+    for (const d of [snapBin, exports, path]) mkdirSync(d, { recursive: true });
+    // A same-named command elsewhere on PATH is not the snap.
+    writeFileSync(join(path, 'chromium'), '');
+    expect(setupBrowsers(home, 'linux', [path, snapBin, exports], null)).toEqual([]);
+    writeFileSync(join(snapBin, 'chromium'), '');
+    writeFileSync(join(exports, 'org.chromium.Chromium'), '');
+    expect(setupBrowsers(home, 'linux', [path, snapBin, exports], 'org.chromium.Chromium.desktop')).toEqual([
+      {
+        name: 'Chromium (Flatpak)',
+        app: 'flatpak:org.chromium.Chromium',
+        extensionsUrl: 'chrome://extensions',
+        extensionPath: join(home, '.var', 'app', 'org.chromium.Chromium', 'data', 'stem', 'extension')
+      },
+      {
+        name: 'Chromium (Snap)',
+        app: 'snap:chromium',
+        extensionsUrl: 'chrome://extensions',
+        extensionPath: join(home, 'snap', 'chromium', 'common', 'stem', 'extension')
+      }
+    ]);
+    expect(extensionsPageUrl('flatpak:com.microsoft.Edge')).toBe('edge://extensions');
+  });
+
+  it('starts only the Snap and Flatpak browsers it knows, and takes only well-formed relay hellos', () => {
+    expect(launchableOnLinux('snap:chromium')).toBe(true);
+    expect(launchableOnLinux('flatpak:com.google.Chrome')).toBe(true);
+    for (const bad of ['snap:evil', 'flatpak:org.evil.App', 'snap:toString', 'flatpak:', 'snap:../x']) {
+      expect(launchableOnLinux(bad)).toBe(false);
+    }
+    expect(sandboxOf('snap:chromium')).toEqual({ kind: 'snap', id: 'chromium' });
+    expect(sandboxOf('flatpak:com.brave.Browser')).toEqual({ kind: 'flatpak', id: 'com.brave.Browser' });
+    expect(sandboxOf('flatpak:Chrome')).toBeNull();
+    expect(sandboxOf('/usr/bin/chromium')).toBeNull();
+    const nonce = 'a'.repeat(32);
+    expect(parseRelayHello(`STEM-RELAY 1 ${nonce} snap:chromium`)).toEqual({ nonce, app: 'snap:chromium' });
+    expect(parseRelayHello(`STEM-RELAY 2 ${nonce} snap:chromium`)).toBeNull();
+    expect(parseRelayHello(`STEM-RELAY 1 ${nonce} /usr/bin/chromium`)).toBeNull();
+    expect(parseRelayHello(`STEM-RELAY 1 short snap:chromium`)).toBeNull();
   });
 });
 

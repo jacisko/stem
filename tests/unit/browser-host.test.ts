@@ -3,7 +3,8 @@
 // switch read fresh on every request, launching the chosen browser when it is
 // closed, and the file traffic around uploads and downloads. The native host
 // is played here by a socket peer speaking the same frames.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createBrowserHost, type BrowserHost } from '../../src/desktop/browser-host';
 import { parseArcTabs, type ArcSidebarTab } from '../../src/desktop/browser-host/arc-tabs';
 import { browserInstallPaths, ensureHostConfig } from '../../src/desktop/browser-host/install';
+import { relayKey } from '../../src/desktop/browser-host/relay';
 import { writeBrowserHostEnabled } from '../../src/desktop/browser-host/store';
 import { encodeFrame, FrameReader, type ServerHello, type ToExtension } from '../../src/shared/browser-native';
 import { handshakeProof, newNonce, proofMatches } from '../../src/desktop/browser-host/handshake';
@@ -643,5 +645,182 @@ describe('createBrowserHost on Linux', () => {
       'only starts browsers it knows'
     );
     expect(launched).toEqual([]);
+  });
+});
+
+/** bash with /dev/tcp and `wait -n` (4.3+), and sha256sum: what the relay needs. macOS's bash 3.2 is not it. */
+const relayRuns = (() => {
+  if (process.platform === 'win32') return false;
+  const r = spawnSync('bash', ['-c', '(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )) && command -v sha256sum'], { encoding: 'utf8' });
+  return r.status === 0;
+})();
+
+describe.skipIf(!relayRuns)('createBrowserHost with a Snap browser, through the real relay', () => {
+  let root: string;
+  let home: string;
+  let host: BrowserHost;
+  let invoked: Array<{ channel: string; args: unknown[] }>;
+  let launched: string[];
+  let uploads: string[];
+  const relays: ChildProcess[] = [];
+
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), 'sbs-'));
+    home = join(root, 'home');
+    const extSource = join(root, 'ext-src');
+    mkdirSync(extSource);
+    writeFileSync(join(extSource, 'manifest.json'), '{"manifest_version":3}');
+    const data = join(home, 'snap', 'chromium', 'common', 'chromium');
+    mkdirSync(join(data, 'Default'), { recursive: true });
+    writeFileSync(join(data, 'Local State'), '{}');
+    process.env.STEM_BROWSER_HOST_FILE = join(root, 'browser-host.json');
+    invoked = [];
+    launched = [];
+    uploads = [];
+    host = createBrowserHost({
+      invoke: async (channel, args) => void invoked.push({ channel, args }),
+      uploadFile: async (path) => {
+        uploads.push(path);
+        return `stem-upload:${uploads.length}`;
+      },
+      downloadOutbox: async (id, dir, name) => {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, name), `bytes of ${id}`);
+        return join(dir, name);
+      },
+      installSource: () => ({ extensionSource: extSource, hostScript: '/dev/null', nodeCommand: '/bin/false' }),
+      home,
+      launch: async (app) => void launched.push(app),
+      openWith: async () => undefined,
+      paths: browserInstallPaths(root),
+      platform: 'linux',
+      launchWaitMs: 300
+    });
+    await host.start();
+    await host.setUp();
+    await writeBrowserHostEnabled(true);
+  });
+
+  afterEach(() => {
+    for (const r of relays.splice(0)) r.kill();
+    host.close();
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.STEM_BROWSER_HOST_FILE;
+  });
+
+  /** The browser's side: start the relay as Chromium would, and talk native messaging on its stdio. */
+  function startRelay() {
+    const child = spawn(join(home, 'snap', 'chromium', 'common', 'stem', 'stem-browser-host'), [], { stdio: ['pipe', 'pipe', 'inherit'] });
+    relays.push(child);
+    const reader = new FrameReader();
+    const received: ToExtension[] = [];
+    child.stdout!.on('data', (c: Buffer) => {
+      for (const body of reader.push(c)) received.push(JSON.parse(body.toString('utf8')) as ToExtension);
+    });
+    const next = async (type: ToExtension['type']): Promise<ToExtension> => {
+      await until(() => received.some((m) => m.type === type));
+      const at = received.findIndex((m) => m.type === type);
+      expect(at).toBeGreaterThanOrEqual(0);
+      return received.splice(at, 1)[0]!;
+    };
+    const send = (m: unknown) => void child.stdin!.write(encodeFrame(m));
+    const exited = new Promise<number | null>((resolve) => child.on('exit', (code) => resolve(code)));
+    return { child, next, send, exited };
+  }
+
+  const result = (requestId: string) =>
+    invoked.find((c) => c.channel === 'browserHost:result' && c.args[0] === requestId)?.args[1] as
+      | { ok: boolean; error?: string; text?: string; downloads?: unknown[] }
+      | undefined;
+
+  it('connects through the relay, stages uploads where the snap can read them, and copies its downloads itself', async () => {
+    const ext = startRelay();
+    ext.send({ type: 'hello', protocol: 1, extensionId: 'x', extensionVersion: '0.7.5', userAgent: 'UA', profileId: 'profile-1234' });
+    expect(await ext.next('host')).toEqual({ type: 'host', connected: true });
+    await until(() => JSON.stringify(invoked).includes('0.7.5'));
+    expect(invoked.filter((c) => c.channel === 'browserHost:announce').at(-1)!.args[0]).toMatchObject({
+      browsers: [{ id: 'snap:chromium#profile-1234', name: 'Chromium (Snap)', connected: true }]
+    });
+
+    host.onRequest({ requestId: 'r1', threadId: 't1', action: { kind: 'upload', ref: 'e1', files: [{ id: 'a'.repeat(32), name: 'cv.pdf', size: 3 }] } });
+    const sent = (await ext.next('request')) as Extract<ToExtension, { type: 'request' }>;
+    const paths = (sent.action as { paths: string[] }).paths;
+    expect(paths[0]!.startsWith(join(home, 'snap', 'chromium', 'common', 'stem', 'uploads') + '/')).toBe(true);
+
+    mkdirSync(join(home, 'Downloads'));
+    writeFileSync(join(home, 'Downloads', 'report.pdf'), 'REPORT');
+    // What a compromised sandboxed browser could claim: a file outside Downloads, or a link to one inside it.
+    writeFileSync(join(home, 'id_ed25519'), 'SECRET');
+    symlinkSync(join(home, 'id_ed25519'), join(home, 'Downloads', 'key.txt'));
+    // A FIFO would hang a blocking open forever.
+    expect(spawnSync('mkfifo', [join(home, 'Downloads', 'pipe')]).status).toBe(0);
+    ext.send({
+      type: 'result',
+      id: 'r1',
+      result: {
+        ok: true,
+        text: 'done',
+        downloads: [
+          { path: join(home, 'Downloads', 'report.pdf'), name: 'report.pdf', size: 6 },
+          { path: join(home, 'id_ed25519'), name: 'id_ed25519', size: 6 },
+          { path: join(home, 'Downloads', 'key.txt'), name: 'key.txt', size: 6 },
+          { path: join(home, 'Downloads', '..', 'id_ed25519'), name: 'sneaky', size: 6 },
+          { path: join(home, 'Downloads', 'pipe'), name: 'pipe', size: 0 }
+        ]
+      }
+    });
+    await until(() => !!result('r1'));
+    expect(result('r1')).toMatchObject({ ok: true, downloads: [{ handle: 'stem-upload:1', name: 'report.pdf' }] });
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]).toMatch(/spool[\\/][0-9a-f]{16}[\\/]report\.pdf$/);
+    expect(result('r1')!.text).toContain('“id_ed25519” finished on the computer but could not be copied');
+    expect(result('r1')!.text).toContain('“pipe”');
+    expect(existsSync(paths[0]!)).toBe(true);
+    host.onEnd({ threadId: 't1' });
+    await until(() => !existsSync(paths[0]!));
+    expect(existsSync(paths[0]!)).toBe(false);
+
+    // The browser closes the port: the relay exits and Stem sees the browser gone, then starts it by its snap.
+    ext.child.stdin!.end();
+    expect(await ext.exited).toBe(0);
+    await until(() => invoked.filter((c) => c.channel === 'browserHost:announce').at(-1)!.args[0] !== undefined &&
+      JSON.stringify(invoked.filter((c) => c.channel === 'browserHost:announce').at(-1)!.args[0]).includes('"connected":false'));
+    host.onRequest({ requestId: 'r2', threadId: 't1', action: { kind: 'tabs' } });
+    await until(() => launched.length === 1);
+    expect(launched).toEqual(['snap:chromium']);
+  });
+
+  it('refuses a peer on the port without the token, or for a browser not set up here', async () => {
+    const { relayPort, relaySecret, token } = await ensureHostConfig(browserInstallPaths(root));
+    const key = relayKey(relaySecret, 'snap:chromium');
+    const talk = async (hello: string, proofToken: string) => {
+      const s = createConnection(relayPort, '127.0.0.1');
+      let text = '';
+      s.on('data', (c) => {
+        text += c.toString();
+        const line = text.split('\n')[0]!;
+        if (text.includes('\n') && !s.destroyed) {
+          const [nonce] = line.split(' ');
+          s.write(`${handshakeProof(proofToken, 'host', nonce!)}\n`);
+          s.write(encodeFrame({ type: 'hello', protocol: 1, extensionId: 'x', extensionVersion: 'evil', userAgent: 'UA' }));
+        }
+      });
+      s.on('error', () => undefined);
+      await new Promise<void>((r) => s.once('connect', () => r()));
+      s.write(hello);
+      await new Promise<void>((r) => s.on('close', () => r()));
+      return text;
+    };
+    const nonce = newNonce();
+    // Not set up here: no answer at all.
+    expect(await talk(`STEM-RELAY 1 ${nonce} snap:brave\n`, token)).toBe('');
+    // The wrong key — the profile's token, or another browser's relay key: the
+    // desktop proves itself, then hangs up without taking a frame.
+    for (const wrong of [token, relayKey(relaySecret, 'flatpak:com.google.Chrome')]) {
+      const answer = await talk(`STEM-RELAY 1 ${nonce} snap:chromium\n`, wrong);
+      const [, proof] = answer.trim().split(' ');
+      expect(proofMatches(key, 'stem', nonce, proof)).toBe(true);
+    }
+    expect(JSON.stringify(invoked)).not.toContain('evil');
   });
 });
