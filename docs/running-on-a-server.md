@@ -93,13 +93,25 @@ taken as part of the passphrase.
 > Do not put the passphrase in `.env`, and do not commit `stem_key`. `docker-compose.yml`
 > names the *path*; the value stays on the disk of the machine that needs it.
 
-## 3. Build the images
+## 3. Get the images
+
+```
+docker compose pull stem
+docker compose build caddy updater
+```
+
+`stem` is the published release image (`ghcr.io/join3r/stem-server`), which is what lets
+the server [upgrade itself](#upgrading) later. `caddy` and `updater` are small and built
+here.
+
+To build Stem from this checkout instead — to run unreleased code, or to change it:
 
 ```
 STEM_GIT_SHA=$(git rev-parse --short=12 HEAD) docker compose build
 ```
 
-`STEM_GIT_SHA` is optional. It goes into the version Stem stamps on every mail and chat
+A server built that way is never upgraded automatically: the updater would replace your
+build with a release. `STEM_GIT_SHA` is optional. It goes into the version Stem stamps on every mail and chat
 turn (which persona / skills / memory code produced it — see `node scripts/sys-version.mjs`),
 so a later debugging pass can tell which turns the current code made. Without it the stamp
 still carries the three code hashes, just not the commit.
@@ -310,6 +322,35 @@ ranking. The picker browses the SERVER's disk, because that is where the models 
 
 ## Upgrading
 
+**On the published image, the server upgrades itself.** Every Stem app that connects
+tells the server its version. When an app newer than the server shows up and no reply is
+being written, the `updater` container:
+
+1. downloads the release image for that app's version, while the old server keeps running
+2. stops the server and backs its state up with the old version, into `./backups`
+   (`STEM_BACKUP_DIR`), keeping the newest three
+3. sets `STEM_TAG` in `.env` to the new version and starts the server again
+4. goes back to the old version if the new one has not started within two minutes
+
+So updating the app on your Mac is all it takes; the server follows within a few minutes.
+It only ever goes up, and never past the newest app you run. **Settings → Server →
+Version** shows where it stands, has an **Upgrade** button, and can turn the automatic part
+off.
+
+The updater has the Docker socket, which is root on this host. It is the only container
+that does, it has no port, and the one thing it reads from the server is a version
+string it checks before using. If you would rather not have it, delete the `updater`
+service from `docker-compose.yml` and upgrade by hand:
+
+```
+cd /opt/stem
+git pull
+docker compose pull stem          # or set STEM_TAG=<version> in .env first
+docker compose up -d
+```
+
+**Built from source**, take a backup and rebuild:
+
 ```
 cd /opt/stem
 docker compose run --rm -v /backups:/backup \
@@ -321,12 +362,13 @@ docker compose up -d
 
 Nothing touches the state root, the model cache, what `uvx`/`npx` downloaded, tools
 installed with `uv tool install`, or Caddy's certificates: they are a bind mount and
-named volumes, and rebuilding an image does not go near them. What *is* lost is anything
+named volumes, and replacing an image does not go near them. What *is* lost is anything
 installed with `apt-get` into the running container — that lived in the container's own
-filesystem, which is exactly what an upgrade replaces. Take the backup
-anyway — it costs a minute and it is the only thing that makes going back possible.
+filesystem, which is exactly what an upgrade replaces.
 
-To go back, check out the previous commit and run the same two commands.
+To go back, set `STEM_TAG` in `.env` to the previous version (or check out the previous
+commit and rebuild) and `docker compose up -d`. The backups in `./backups` restore with
+`import`, as in step 4.
 
 ## When it does not come up
 

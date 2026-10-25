@@ -435,6 +435,12 @@ let mirrorHost: MirrorHost | null = null;
  */
 let serverReachable = true;
 
+const CLIENT_VERSION_REPORT_MS = 6 * 60 * 60 * 1000;
+
+function reportClientVersion(): void {
+  void proxy?.invoke('serverUpgrade:status', [app.getVersion()]).catch(() => undefined);
+}
+
 app.whenReady().then(async () => {
   // Strict CSP for the renderer in production: only self, no remote/inline
   // script. Skipped in dev so the Vite dev server / HMR can run. Installed
@@ -632,6 +638,7 @@ app.whenReady().then(async () => {
     // on the push queue's path (it is created up front and only ever hidden), so
     // it is sent to directly.
     connection: (reachable) => {
+      if (reachable && !serverReachable && !server) reportClientVersion();
       serverReachable = reachable;
       sendToMain('client:connectionChanged', reachable);
       quickChat.sendToOverlay('client:connectionChanged', reachable);
@@ -708,6 +715,14 @@ app.whenReady().then(async () => {
     for (const { channel, payload } of mainPushQueue.markReady()) win.webContents.send(channel, payload);
   });
   bindServerChannels(channels, (channel, args) => proxy!.invoke(channel, args));
+  // A remote server upgrades itself to the newest client version it hears of
+  // (server/upgrade.ts), so tell it ours: now, on every reconnect, and now and
+  // then for a server that never drops. A server too old to know the channel
+  // refuses it, and that server is upgraded by hand.
+  if (!server) {
+    reportClientVersion();
+    setInterval(reportClientVersion, CLIENT_VERSION_REPORT_MS).unref();
+  }
 
   const settings = (await proxy.invoke('settings:get', [])) as AppSettings;
   // An install that has not been set up yet is owed no release notes: whatever

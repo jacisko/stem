@@ -219,3 +219,81 @@ jobs:
           files: artifacts/*
           draft: false
           generate_release_notes: true
+
+  # The server image, for docker-compose.yml's `stem` service and the updater
+  # that upgrades it (src/server/upgrade.ts). Built natively per arch — native
+  # deps under QEMU take the better part of an hour — pushed by digest, then
+  # joined into one multi-arch tag below. Only on a tag: the updater pulls the
+  # version a client runs, so every published tag has to be a real release.
+  server-image:
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            STEM_GIT_SHA=${{ github.sha }}
+            STEM_RELEASE_IMAGE=1
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/stem-server,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=server-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=server-${{ matrix.platform }}
+      - name: Record the digest
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-digest-${{ strategy.job-index }}
+          path: digests/*
+          if-no-files-found: error
+
+  server-image-manifest:
+    needs: [server-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: server-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the release and latest
+        working-directory: digests
+        run: |
+          image="ghcr.io/${OWNER,,}/stem-server"
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create -t "$image:$version" -t "$image:latest" \
+            $(printf "$image@sha256:%s " *)
+        env:
+          OWNER: ${{ github.repository_owner }}

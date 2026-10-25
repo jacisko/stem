@@ -5554,6 +5554,10 @@ export interface StemApi {
   // Devices: which clients may reach the server, and how a new one is admitted.
   /** Every registered device plus any pairing code still outstanding. */
   listDevices(): Promise<DevicesSnapshot>;
+  serverUpgradeStatus(): Promise<ServerUpgradeStatus>;
+  startServerUpgrade(): Promise<ServerUpgradeStatus>;
+  setServerAutoUpgrade(auto: boolean): Promise<ServerUpgradeStatus>;
+  onServerUpgradeChanged(listener: (status: ServerUpgradeStatus) => void): () => void;
   /** Remove a device's credential and cut any event stream it has open. */
   revokeDevice(id: string): Promise<DevicesSnapshot>;
   /** Mint a one-shot pairing code for a device that will be called `label`. */
@@ -5782,4 +5786,31 @@ export interface MemoryCheckSummary {
   openProposals: number;
   questions: number;
   openQuestions: number;
+}
+
+/**
+ * Where a server's own upgrade stands, as Settings → Server shows it. The
+ * server knows its version; clients report theirs (serverUpgrade:status), and
+ * the newest one is the target. The upgrade itself is done by the updater
+ * sidecar in docker-compose.yml — see src/server/upgrade.ts.
+ */
+export interface ServerUpgradeStatus {
+  serverVersion: string;
+  /** Newest version any client has reported since this server started, or null. */
+  newestClient: string | null;
+  /**
+   * absent: no updater beside this server (desktop, or a compose file without
+   *   the sidecar) — upgrading is the operator's job.
+   * source: the image was built from source, not pulled from a release; the
+   *   updater stays out of the way so a pull never replaces local work.
+   * ready / working / failed: the updater is there and is idle, busy, or failed
+   *   last time.
+   */
+  updater: 'absent' | 'source' | 'ready' | 'working' | 'failed';
+  /** The version being installed (working) or that failed (failed). */
+  target: string | null;
+  /** What the updater is doing, or why it failed, in its own words. */
+  detail: string | null;
+  /** Whether the server upgrades itself when a newer client shows up. */
+  auto: boolean;
 }

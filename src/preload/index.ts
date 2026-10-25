@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { startCapture, stopCapture } from './dictation-capture';
 import type {
   FolderSettings,
+  ServerUpgradeStatus,
   ActivitySnapshot,
   ApprovalResolvedPayload,
   ApiKeyProviderId,
@@ -601,6 +602,14 @@ const api: StemApi = {
   },
 
   listDevices: () => ipcRenderer.invoke('devices:list'),
+  serverUpgradeStatus: () => ipcRenderer.invoke('serverUpgrade:status'),
+  startServerUpgrade: () => ipcRenderer.invoke('serverUpgrade:start'),
+  setServerAutoUpgrade: (auto: boolean) => ipcRenderer.invoke('serverUpgrade:setAuto', auto),
+  onServerUpgradeChanged: (listener: (status: ServerUpgradeStatus) => void) => {
+    const handler = (_e: unknown, status: ServerUpgradeStatus) => listener(status);
+    ipcRenderer.on('serverUpgrade:changed', handler);
+    return () => ipcRenderer.removeListener('serverUpgrade:changed', handler);
+  },
   revokeDevice: (id: string) => ipcRenderer.invoke('devices:revoke', id),
   createPairingCode: (label: string) => ipcRenderer.invoke('devices:createPairingCode', label),
   clientInfo: () => ipcRenderer.invoke('client:info'),

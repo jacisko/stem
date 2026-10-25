@@ -31,10 +31,12 @@ playwright-report/
 
 # The deployment's own, on the machine that runs it (see docs/running-on-a-server.md).
 # stem_key holds the passphrase that opens every saved tool credential, .env holds the
-# hostname and paths, and state/ is somebody's whole Stem.
+# hostname and paths, and state/ is somebody's whole Stem — backups/ too, being the
+# updater's copies of it.
 .env
 stem_key
 /state/
+/backups/
 
 # Local Obsidian vault state for docs/ (per-machine editor layout)
 docs/.obsidian/

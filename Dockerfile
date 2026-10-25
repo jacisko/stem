@@ -198,6 +198,13 @@ RUN mkdir -p /var/lib/stem/state /var/lib/stem/models /var/lib/stem/cache/bin /r
 # It costs less than it looks: the process opens no port (a Unix socket is all it
 # binds), and the only other thing in this namespace is its own state.
 
+# 1 only in the image release.yml publishes to ghcr.io. It is how the server
+# tells a published release (which the updater may replace with a newer one)
+# from an image built out of somebody's checkout (which it must not): see
+# src/server/upgrade.ts.
+ARG STEM_RELEASE_IMAGE=
+ENV STEM_RELEASE_IMAGE=${STEM_RELEASE_IMAGE}
+
 # No HEALTHCHECK: there is nothing to curl. Caddy in the next container is what
 # has an opinion about whether this socket answers, and it says so in its log.
 CMD ["node", "dist/main/server.js"]

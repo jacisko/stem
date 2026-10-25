@@ -29,6 +29,8 @@ docs/screenshots
 # that survives every `docker save` and every registry push.
 stem_key
 *.tar
+# The updater's pre-upgrade backups: somebody's whole Stem, credentials included.
+backups
 
 # The relay is a separate Go program with its own image (relay/Dockerfile).
 relay

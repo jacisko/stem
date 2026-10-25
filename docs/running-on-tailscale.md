@@ -45,7 +45,7 @@ Do **not** port-forward 80 or 443 on the router for this path.
 Everything below assumes you are in a checkout at `/opt/stem`. Adjust as you
 like; nothing depends on the path.
 
-The archive, `stem_key`, `docker compose build`, import, pairing codes, backups
+The archive, `stem_key`, `docker compose pull`, import, pairing codes, backups
 and upgrades are the same commands as [Running on a server](running-on-a-server.md).
 Only the `.env` lines, the compose overlay, and how HTTPS is obtained are
 different.
@@ -89,7 +89,8 @@ chmod 600 /opt/stem/stem_key
 Same as the public path: import the archive if you have one, then:
 
 ```
-docker compose build
+docker compose pull stem
+docker compose build caddy updater
 docker compose up -d
 docker compose logs -f caddy
 ```

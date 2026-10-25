@@ -3,10 +3,12 @@ import type {
   ClientInfo,
   DevicesSnapshot,
   PairingCodeInfo,
+  ServerUpgradeStatus,
   StateExportReport
 } from '../../../../shared/types';
 import { InfoTip } from '../../../ui/InfoTip';
 import { PairPhoneDialog } from '../../PairPhoneDialog';
+import { ValueRow } from './rows';
 
 /**
  * Settings → Server: where this Stem actually runs, and everything that follows
@@ -16,8 +18,101 @@ export function ServerSettings() {
   return (
     <div>
       <ServerSection />
+      <VersionSection />
       <DevicesSection />
     </div>
+  );
+}
+
+/**
+ * Settings → Server → Version: a server elsewhere upgrades itself to the
+ * newest app version that connects to it (src/server/upgrade.ts). Shown only
+ * for such a server — the one this app starts is always the app's own version.
+ * A server too old to know the channel shows nothing; it predates all of this.
+ */
+function VersionSection() {
+  const [status, setStatus] = useState<ServerUpgradeStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    void window.stem
+      .clientInfo()
+      .then((info) => (info.remote ? window.stem.serverUpgradeStatus() : null))
+      .then((s) => live && setStatus(s))
+      .catch(() => undefined);
+    const off = window.stem.onServerUpgradeChanged((s) => live && setStatus(s));
+    return () => {
+      live = false;
+      off();
+    };
+  }, []);
+
+  async function run(act: () => Promise<ServerUpgradeStatus>) {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await act());
+    } catch (e) {
+      setError(String((e as Error)?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!status) return null;
+  const behind = status.newestClient && status.newestClient !== status.serverVersion ? status.newestClient : null;
+  const hint =
+    status.updater === 'working'
+      ? `Upgrading to ${status.target}${status.detail ? ` — ${status.detail}` : ''}`
+      : status.updater === 'failed'
+        ? `Upgrade to ${status.target} failed${status.detail ? `: ${status.detail}` : ''}`
+        : status.updater === 'absent'
+          ? behind
+            ? `This app is ${behind}. The server has no updater, so upgrade it by hand.`
+            : 'No updater beside this server'
+          : status.updater === 'source'
+            ? 'Built from source — upgrade it the way you built it'
+            : behind
+              ? `This app is ${behind}`
+              : 'Up to date with your apps';
+  const canUpgrade = (status.updater === 'ready' || status.updater === 'failed') && !!behind;
+
+  return (
+    <>
+      <div className="grp-head grp-head-row">
+        Version
+        <InfoTip label="About server upgrades">
+          A server running the published Stem image upgrades itself to the newest app version that
+          connects to it, once no reply is being written. It takes a backup first and goes back to
+          the old version if the new one does not start. It needs the updater container from
+          docker-compose.yml.
+        </InfoTip>
+      </div>
+      <div className="group">
+        <ValueRow label={`Server ${status.serverVersion}`} hint={hint}>
+          {canUpgrade && (
+            <button type="button" className="push" disabled={busy} onClick={() => void run(() => window.stem.startServerUpgrade())}>
+              Upgrade
+            </button>
+          )}
+        </ValueRow>
+        {(status.updater === 'ready' || status.updater === 'working' || status.updater === 'failed') && (
+          <ValueRow label="Upgrade automatically" hint="When a newer app connects">
+            <input
+              type="checkbox"
+              className="vcheck"
+              aria-label="Upgrade the server automatically"
+              checked={status.auto}
+              disabled={busy}
+              onChange={(e) => void run(() => window.stem.setServerAutoUpgrade(e.target.checked))}
+            />
+          </ValueRow>
+        )}
+      </div>
+      {error && <p className="muted">{error}</p>}
+    </>
   );
 }
 

@@ -9,6 +9,7 @@ import {
   registerAuthIpc,
   registerChatsIpc,
   registerDevicesIpc,
+  registerUpgradeIpc,
   registerMcpIpc,
   registerMemoryIpc,
   registerMemoryCheckIpc,
@@ -23,6 +24,7 @@ import {
   type IpcDeps
 } from './ipc';
 import { degrade } from './degrade';
+import { createServerUpgrader } from './upgrade';
 import { InterStemService } from './interstem/service';
 import { log } from './log';
 import { ensureWorkspace } from './workspace/bootstrap';
@@ -428,6 +430,7 @@ function registerIpc(): void {
     if (runtime) void nameAfterFirstReply(mailSubjectDeps(), item);
   });
   registerDevicesIpc();
+  registerUpgradeIpc(createServerUpgrader({ emit: (status) => emit('serverUpgrade:changed', status) }));
   registerHarnessIpc({
     // A device announcing it runs coding agents is the wake-up the mail
     // device-queue waits for (clients re-announce on every reconnect).

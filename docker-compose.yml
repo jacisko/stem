@@ -26,7 +26,12 @@ services:
         # Build with STEM_GIT_SHA=$(git rev-parse --short=12 HEAD) in the
         # environment (or .env); left empty, the stamp just omits it.
         STEM_GIT_SHA: ${STEM_GIT_SHA:-}
-    image: stem-server:local
+    # The published release image, pinned by STEM_TAG — which the updater
+    # below rewrites in .env when it upgrades. `docker compose up` pulls it;
+    # `docker compose build` builds the same name from this checkout instead,
+    # and a server built that way is never upgraded by the updater (it would
+    # throw your build away), so the build-from-source path is unchanged.
+    image: ${STEM_IMAGE:-ghcr.io/join3r/stem-server}:${STEM_TAG:-latest}
     # A VPS is x86_64 unless it says otherwise. On an arm server (Hetzner CAX,
     # Ampere, a Pi) put STEM_PLATFORM=linux/arm64 in .env — and note that
     # building on the machine that will run it is always the faster path, because
@@ -94,8 +99,38 @@ services:
       - stem-cache:/var/lib/stem/cache
       # The socket lives here, and caddy mounts the same volume.
       - stem-socket:/run/stem
+      # Where the updater's pre-upgrade backups land (the newest three).
+      - ${STEM_BACKUP_DIR:-./backups}:/var/lib/stem/backups
+      # The files the server and the updater talk through. See src/server/upgrade.ts.
+      - stem-updater:/run/stem-updater
     secrets:
       - stem_key
+
+  # Upgrades the server to the newest app version that connects to it, after a
+  # backup, and goes back if the new version does not start. The only container
+  # with the docker socket — which is root on this host — and it uses it to run
+  # deploy/updater/updater.sh and nothing else: no port, and the one thing it
+  # reads from the server is a version string it checks before use.
+  #
+  # Don't want it? Delete this service; the server then says "upgrade by hand"
+  # and everything else works as before.
+  #
+  # It runs compose on the host's behalf, so this directory is mounted at the
+  # same path it has on the host. Compose fills ${PWD} from the shell you run it
+  # in; if you start it some other way (systemd, cron), set STEM_DIR in .env to
+  # this directory's absolute path.
+  updater:
+    build:
+      context: ./deploy/updater
+    image: stem-updater:local
+    restart: unless-stopped
+    environment:
+      STEM_DIR: ${STEM_DIR:-${PWD}}
+      STEM_IMAGE: ${STEM_IMAGE:-ghcr.io/join3r/stem-server}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${STEM_DIR:-${PWD}}:${STEM_DIR:-${PWD}}
+      - stem-updater:/run/stem-updater
 
   # The front door. TLS, rate limits, access log — see deploy/Caddyfile.
   caddy:
@@ -138,5 +173,6 @@ volumes:
   stem-models:
   stem-cache:
   stem-socket:
+  stem-updater:
   caddy-data:
   caddy-config:

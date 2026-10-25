@@ -258,6 +258,8 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   // act on it later — the handler does not read it today, and the contract says
   // it never has to (see ipc/devices.ts).
   'devices:presence': [a.number],
+  'serverUpgrade:status': [a.optional(a.string)],
+  'serverUpgrade:setAuto': [a.boolean],
   'settings:updateQuickChat': [a.object],
   'settings:updateWebSearch': [a.object],
   'settings:updateEscapeAction': [a.oneOf(['off', 'single', 'twoStage'])],

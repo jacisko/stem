@@ -14,6 +14,7 @@ export type { IpcDeps } from './deps';
 export { registerAuthIpc } from './auth';
 export { chatListOf, registerChatsIpc } from './chats';
 export { registerDevicesIpc } from './devices';
+export { registerUpgradeIpc } from './upgrade';
 export { registerMcpIpc } from './mcp';
 export { registerMailIpc } from './mail';
 export { registerInterStemIpc } from './interstem';
