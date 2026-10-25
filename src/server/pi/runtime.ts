@@ -167,7 +167,7 @@ import { trackGeneration } from './generation-speed';
 import { PiWorker } from './worker';
 import { findImageInEntries, newImageId, parseImagesMarker, stemImageOf } from './image-gen.mjs';
 import { cameFromInput, jsonNeedle } from '../chats/remote-image';
-import { mailPreamble, personaNotesBlock, priorReportsBlock } from '../mail/preamble';
+import { lookupsLine, mailPreamble, personaNotesBlock, priorReportsBlock, type Lookups } from '../mail/preamble';
 import { systemVersion } from '../sys-version';
 import { secretKeyHex } from './secrets';
 import {
@@ -234,11 +234,17 @@ const SCHED_STRIP_RE = /^<!--stem:scheduled at="([^"]*)"-->[\s\S]*?<!--\/stem:sc
  * here — the same block a mail delivery renders — so what the persona learned
  * on one schedule is in front of it on the next.
  */
-function scheduledPreamble(at: string, notes?: { id: string; title: string }[], prior?: ScheduledRunReport[]): string {
+function scheduledPreamble(
+  at: string,
+  notes?: { id: string; title: string }[],
+  prior?: ScheduledRunReport[],
+  lookups?: Lookups
+): string {
   const reported = priorReportsBlock(prior ?? [], SCHED_CLOSE);
   return [
     `<!--stem:scheduled at="${at}"-->`,
     'This is an automated scheduled run — no human is reading the reply live. Carry out the task.',
+    ...lookupsLine(lookups),
     reported.length
       ? 'This run has no memory of any earlier conversation: the task prompt below and the list of what earlier runs already reported are everything you know about it.'
       : 'This run has no memory of any earlier conversation: the task prompt below is everything you know about it.',
@@ -5148,15 +5154,24 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
     // model knows it's running headless and the persisted message carries the marker.
     // A mail delivery does the same with its own fence — who the mail is from, and
     // that the final message becomes the reply.
+    // Headless turns are told to look things up rather than answer fast — only
+    // with the lookups this turn actually has (mirrors the turn-context gate).
+    const lookups: Lookups | undefined = input.persona?.harness
+      ? undefined
+      : {
+          memory: isRecallEnabled() && input.persona?.recall !== false && !turn?.isPrivate,
+          web: !input.mail?.external
+        };
     const message = input.scheduled
-      ? `${input.scheduled.resumed ? resumedPreamble(input.scheduled.at) : scheduledPreamble(input.scheduled.at, input.persona?.notes, input.scheduled.prior)}\n\n${body}`
+      ? `${input.scheduled.resumed ? resumedPreamble(input.scheduled.at) : scheduledPreamble(input.scheduled.at, input.persona?.notes, input.scheduled.prior, lookups)}\n\n${body}`
       : input.mail
         ? `${mailPreamble(
             input.mail,
             input.persona?.id,
             input.persona?.notes,
             input.persona?.recall === false,
-            input.persona?.answers
+            input.persona?.answers,
+            lookups
           )}\n\n${body}`
         : body;
     return { message, images };

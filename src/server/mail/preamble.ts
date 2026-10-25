@@ -78,6 +78,43 @@ export function standingAnswersBlock(answers: { title: string; body: string }[] 
   ];
 }
 
+/**
+ * What a headless turn may look up, for lookupsLine: the user's memory (off
+ * for a recall-off persona and a private conversation, where the search tools
+ * refuse) and the web (off in an inter-Stem external conversation).
+ */
+export interface Lookups {
+  memory: boolean;
+  web: boolean;
+}
+
+/**
+ * Mail and scheduled runs answered like a live chat: from the injected facts
+ * and what the model already knew, rarely a search_facts or a past-chat look,
+ * because the base prompt's habits are tuned for someone waiting on the reply.
+ * Nobody waits on a mail, so the trade flips — a slower, grounded answer is
+ * the better one. `undefined` renders nothing (a code persona: it relays, and
+ * its own lookups are refused).
+ */
+export function lookupsLine(lookups: Lookups | undefined): string[] {
+  if (!lookups || (!lookups.memory && !lookups.web)) return [];
+  const where = [
+    lookups.memory
+      ? "search the user's memory (search_facts, search_chat_summaries, search_past_chats, search_folder_docs) " +
+        'whenever their situation, earlier conversations or files could shape the answer — the facts shown ' +
+        'with this message are only the few that matched it'
+      : '',
+    lookups.web ? 'look up current or uncertain facts on the web' : ''
+  ]
+    .filter(Boolean)
+    .join(', and ');
+  return [
+    'Nobody is waiting on this reply, so take the time to get it right: a slower answer grounded in lookups ' +
+      `beats a quick one from what you already have. Before answering, ${where}. Several lookups are fine; ` +
+      'guessing what a search would have told you is not.'
+  ];
+}
+
 /** A persona name as a preamble label: one line, no fence/comment markers, at most 64 chars. */
 function cleanName(name: string | undefined): string {
   if (!name) return '';
@@ -160,7 +197,9 @@ export function mailPreamble(
    */
   blind = false,
   /** Code personas: the user's standing answers, whole (see standingAnswersBlock). */
-  answers?: { title: string; body: string }[]
+  answers?: { title: string; body: string }[],
+  /** What this delivery may look up (see lookupsLine); omitted for a code persona. */
+  lookups?: Lookups
 ): string {
   // The other personas this conversation can reach — the To: list is the closed
   // participant set, and this line is how a persona learns who else is in it.
@@ -366,6 +405,7 @@ export function mailPreamble(
         }. Nobody is reading live.`,
     ...(self ? [`You are ${label(self)}.`] : []),
     'Work the task with your tools. Your final message is sent back to the sender as your reply mail — write it as the reply.',
+    ...lookupsLine(lookups),
     ...(role ? [role] : []),
     ...writing,
     ...memory,

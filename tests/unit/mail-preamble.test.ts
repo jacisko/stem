@@ -377,3 +377,27 @@ describe('mail preamble: writing for models', () => {
     expect(text).toContain('give the checker a share of the ground to search itself');
   });
 });
+
+describe('mail preamble lookups', () => {
+  const mail = { subject: 's', from: 'user', participants: ['driver'] };
+
+  it('tells a delivery to look things up, naming only the lookups it has', () => {
+    const full = mailPreamble(mail, 'driver', undefined, false, undefined, { memory: true, web: true });
+    expect(full).toContain('Nobody is waiting on this reply');
+    expect(full).toContain('search_facts');
+    expect(full).toContain('on the web');
+    const noMemory = mailPreamble(mail, 'driver', undefined, true, undefined, { memory: false, web: true });
+    expect(noMemory).toContain('Nobody is waiting on this reply');
+    expect(noMemory).not.toContain('search_facts');
+    const noWeb = mailPreamble(mail, 'driver', undefined, false, undefined, { memory: true, web: false });
+    expect(noWeb).toContain('search_facts');
+    expect(noWeb).not.toContain('on the web');
+  });
+
+  it('says nothing about lookups to a code persona or a turn with none', () => {
+    expect(mailPreamble(mail, 'driver')).not.toContain('Nobody is waiting on this reply');
+    expect(mailPreamble(mail, 'driver', undefined, false, undefined, { memory: false, web: false })).not.toContain(
+      'Nobody is waiting on this reply'
+    );
+  });
+});
