@@ -146,7 +146,7 @@ export class ShareService {
     const { conversation, items } = await this.readMail(source.conversationId);
     if (!conversation) throw new ShareInputError('That mail conversation is gone.');
     // Another person's mail is theirs to publish, not ours; the memory check is the user's memory.
-    if (conversation.external) throw new ShareInputError('Mail with another person can’t be shared publicly.');
+    if (conversation.external || conversation.outside) throw new ShareInputError('Mail with another person can’t be shared publicly.');
     if (conversation.owner) throw new ShareInputError('This conversation can’t be shared.');
     const personas = await this.personas();
     return {

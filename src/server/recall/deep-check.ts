@@ -4,7 +4,7 @@ import { degrade } from '../degrade';
 import type { LlmClient } from './llm';
 import { mergeDuplicatePair } from './reconcile';
 import { STOPWORDS } from './search-core';
-import { recallStore, type Fact } from './store';
+import { isContactFact, recallStore, type Fact } from './store';
 import type {
   MemoryCheckAction,
   MemoryCheckChangeState,
@@ -151,9 +151,13 @@ function summarizeCheck(check: MemoryCheck): MemoryCheckSummary {
   };
 }
 
-/** Facts the check audits: every live one (active or in an open conflict), folder facts included. */
+/**
+ * Facts the check audits: every live one (active or in an open conflict),
+ * folder facts included. Not what was learned from mail with other people:
+ * those are about them, and the check's questions are about the user.
+ */
 function auditPool(): Fact[] {
-  return getAllFacts().filter((f) => f.status === 'active' || f.status === 'conflicted');
+  return getAllFacts().filter((f) => (f.status === 'active' || f.status === 'conflicted') && !isContactFact(f));
 }
 
 const live = (f: Fact | undefined) => !!f && (f.status === 'active' || f.status === 'conflicted');

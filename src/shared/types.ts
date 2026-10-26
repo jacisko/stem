@@ -161,6 +161,9 @@ export interface MessageAttachment {
   dataUrl?: string;
   /** Replayed images only: the id generate_image `references` can name. */
   imageId?: string;
+  /** Mail with another person: the file's bytes, fetched as GET /files/stem-mailfile:<id>. */
+  fileId?: string;
+  size?: number;
 }
 
 export interface ChatMessage {
@@ -2723,7 +2726,7 @@ export interface FactEvidence {
   /** 'folder_doc' = an indexed connected-folder file (folderId/relPath set).
    *  'assistant_claim_web' = an assistant message from a turn that used web tools,
    *  i.e. the excerpt may restate untrusted public-web content. */
-  origin: 'explicit_user' | 'user_message' | 'assistant_claim' | 'assistant_claim_web' | 'legacy' | 'folder_doc' | 'segment_context';
+  origin: 'explicit_user' | 'user_message' | 'assistant_claim' | 'assistant_claim_web' | 'legacy' | 'folder_doc' | 'segment_context' | 'contact_mail';
   /** Connected-folder id, for 'folder_doc' evidence. */
   folderId?: string | null;
   /** Folder-relative file path, for 'folder_doc' evidence. */
@@ -3147,11 +3150,36 @@ export interface MailExternal {
   held?: boolean;
   /** Inbound: the sender's key differs from the one pinned for them. */
   keyChanged?: boolean;
-  /** Outbound progress. Toward strangers 'sent' is all the relay ever says. */
-  status?: 'queued' | 'sent' | 'delivered' | 'expired' | 'failed' | 'unreachable' | 'key-changed';
+  /**
+   * Outbound progress. Toward strangers 'sent' is all the relay ever says.
+   * 'waiting': they aren't on Stem (or only take mail from people they wrote
+   * to); the mail stays here and Stem looks for them now and then. 'joined':
+   * they can be reached now — the user sends it with one click.
+   * 'unreachable': the wait ran out.
+   */
+  status?: 'queued' | 'sent' | 'delivered' | 'expired' | 'failed' | 'unreachable' | 'key-changed' | 'waiting' | 'joined';
   error?: string;
   /** Inbound mail in a format this Stem doesn't understand. */
   unsupported?: boolean;
+}
+
+/**
+ * Where a conversation with another person stands, written by the memory
+ * model from the mail the user's agents may read (released, and the user's
+ * own). Shown above the thread and on its Inbox row.
+ */
+export interface MailCollab {
+  /** What the two are working out, in a line. */
+  goal: string;
+  /** Settled between them. */
+  agreed: string[];
+  /** Still to decide or do. */
+  open: string[];
+  /** The next step, if one is clear. */
+  next?: string;
+  /** The item it was written from (the newest readable one). */
+  basedOn: string;
+  updatedAt: number;
 }
 
 /** The other side of an inter-Stem conversation. */
@@ -3174,7 +3202,21 @@ export interface InterStemContact {
   /** Their key changed since it was pinned and the user hasn't acknowledged it. */
   keyChanged?: boolean;
   firstSeen: number;
+  /** The name the user gave them (shown beside the address, never instead of it). */
+  name?: string;
+  /**
+   * Their new mail is released to the persona below, which drafts a reply at
+   * once. Only for contacts verified by the user; sending still waits for them.
+   */
+  autoDraft?: boolean;
+  /** The persona that last drafted a reply to them: the default next time. */
+  draftPersona?: string;
 }
+
+/** Whether an address can be mailed, checked before sending (interstem:lookup). */
+export type InterStemReach =
+  | { state: 'reachable' | 'unreachable' | 'self' | 'blocked' }
+  | { state: 'refused'; reason: string };
 
 export interface InterStemAddress {
   address: string;
@@ -3412,6 +3454,15 @@ export interface MailConversation {
    */
   external?: MailExternalThread;
   /**
+   * An internal conversation that carries mail from another person (the
+   * user forwarded it in): every turn in it is external context, the same as
+   * in the conversation with them — side-effect tools gated, nothing captured
+   * as the user's — and what was learned from them is recalled here.
+   */
+  outside?: { address: string };
+  /** Mail with another person: where the collaboration stands (interstem/collab.ts). */
+  collab?: MailCollab;
+  /**
    * 'working' while a delivery is in flight; 'awaiting-user' when the wave is
    * held on the user rather than answered (a paired computer offline, the
    * exchange cap spent) — a persona's answer, explicit or implicit, settles
@@ -3481,6 +3532,12 @@ export interface MailComposeInput {
   attachments?: TurnAttachment[];
   /** Start the conversation private — see MailConversation.private. */
   private?: boolean;
+  /**
+   * A forward: the mail item it carries. When that mail came from (or went
+   * to) another person, the new conversation inherits their mark — see
+   * MailConversation.outside.
+   */
+  forwardOf?: string;
 }
 
 // ---- Chats (backend-backed) + Folders (Stem-owned organization) ----
@@ -5184,10 +5241,23 @@ export interface StemApi {
   /** `body`: a send draft as the user edited it before sending. */
   resolveMailApproval(itemId: string, decision: 'allow' | 'deny', body?: string): Promise<{ ok: boolean; error?: string }>;
   // Inter-Stem mail (docs/inter-stem-mail-design.md).
-  composeExternalMail(input: { to: string; subject?: string; body: string; self?: string }): Promise<MailListResult>;
+  composeExternalMail(input: { to: string; subject?: string; body: string; self?: string; attachments?: TurnAttachment[] }): Promise<MailListResult>;
   /** Let the user's agents see held mail from another Stem, up to and including this item. */
   releaseMail(conversationId: string, itemId: string): Promise<MailListResult>;
-  draftExternalMail(conversationId: string, personaId: string, instructions?: string): Promise<MailListResult>;
+  /** `release`: let the agents read the held mail first (one click: read it and draft). */
+  draftExternalMail(conversationId: string, personaId: string, instructions?: string, release?: boolean): Promise<MailListResult>;
+  /** Send a person's mail again: one that waited for them to join Stem, or failed. */
+  resendExternalMail(conversationId: string, itemId: string): Promise<MailListResult>;
+  interStemLookup(address: string): Promise<InterStemReach>;
+  /** How many facts Stem learned from mail with them. */
+  interStemContactMemory(address: string): Promise<{ facts: number }>;
+  /** Forget every fact learned from mail with them. */
+  interStemForgetContact(address: string): Promise<{ forgotten: number }>;
+  interStemSetContact(address: string, patch: { name?: string | null; autoDraft?: boolean }): Promise<InterStemStatus>;
+  /** A system notification was clicked: open this mail conversation. */
+  onOpenMailConversation(listener: (conversationId: string) => void): () => void;
+  /** Mail from another person just landed (desktop notification). */
+  onInterStemMail(listener: (mail: { conversationId: string; from: string; name?: string; subject?: string }) => void): () => void;
   interStemStatus(): Promise<InterStemStatus>;
   interStemAddAddress(address: string): Promise<InterStemStatus>;
   interStemVerifyAddress(address: string, code: string): Promise<InterStemStatus>;

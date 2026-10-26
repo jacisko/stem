@@ -324,9 +324,10 @@ async function chooseFacts(
   getQueryEmbedding: QueryEmbedGetter,
   timings?: RecallTimings,
   factsGeneration = getFactsGeneration(),
-  rr: FactRerankClient | null = null
+  rr: FactRerankClient | null = null,
+  contact: string | null = null
 ): Promise<{ facts: Fact[]; tier: FactTier }> {
-  const all = getInjectableFacts();
+  const all = getInjectableFacts(contact);
   const limit = Math.min(getMaxRelevantFacts(), rr?.maxFacts ?? Number.POSITIVE_INFINITY);
   const pinned = all
     .filter((f) => f.pinned)
@@ -463,6 +464,8 @@ export interface BuildContextOptions {
   previousUserMessages?: readonly string[];
   /** The current chat — its hits are excluded (already in context). */
   currentThreadId?: string | null;
+  /** A turn in mail with another person: their address, so facts learned from them may join. */
+  contact?: string | null;
   /** Optional sink: filled with the per-stage latency breakdown of this call. */
   timings?: RecallTimings;
   /** Optional sink: filled with the durable facts chosen this turn + their tier. */
@@ -504,7 +507,7 @@ export async function buildRecallContext(
   const getFactEmbedding = factQuery === userText ? getQueryEmbedding : makeQueryEmbedder(factQuery, timings);
 
   const factsStart = Date.now();
-  let { facts, tier } = await chooseFacts(factQuery, getFactEmbedding, timings, factsGeneration, factReranker);
+  let { facts, tier } = await chooseFacts(factQuery, getFactEmbedding, timings, factsGeneration, factReranker, options.contact ?? null);
   if (factReranker?.modelId) log('recall', 'experimental fact selection', {
     model: factReranker.modelId, tier, selected: facts.length,
     contextual: factQuery !== userText

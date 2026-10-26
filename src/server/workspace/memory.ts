@@ -247,6 +247,7 @@ function sourceLabel(source: string, folderLabels: Map<string, string>): string 
     const label = folderLabels.get(source.slice('folder:'.length));
     return label ? `From ${label}` : 'From a disconnected folder';
   }
+  if (source.startsWith('contact:')) return `From mail with ${source.slice('contact:'.length)}`;
   return 'Learned';
 }
 

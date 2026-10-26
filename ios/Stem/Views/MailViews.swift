@@ -1,3 +1,4 @@
+import QuickLook
 import SwiftUI
 
 struct MailListView: View {
@@ -16,6 +17,14 @@ struct MailListView: View {
                     }
                     .pickerStyle(.segmented)
                     .listRowSeparator(.hidden)
+                }
+                if !requests.isEmpty {
+                    // First mail from someone not yet accepted: out of the Inbox until Accept or Block.
+                    Section("Requests") {
+                        ForEach(requests) { c in
+                            NavigationLink(value: Route.mail(c.id)) { MailRow(conversation: c) }
+                        }
+                    }
                 }
                 Section {
                     ForEach(rows) { c in
@@ -82,7 +91,12 @@ struct MailListView: View {
         }
     }
 
-    private var rows: [MailConversation] { session.mail.sections[folder] ?? [] }
+    private var rows: [MailConversation] {
+        (session.mail.sections[folder] ?? []).filter { folder != .inbox || !session.interStem.isRequest($0) }
+    }
+    private var requests: [MailConversation] {
+        folder == .inbox ? (session.mail.sections[.inbox] ?? []).filter { session.interStem.isRequest($0) } : []
+    }
     private var working: [MailConversation] { MailSections.working(session.mail.mail) }
 }
 
@@ -99,9 +113,13 @@ struct MailRow: View {
             Circle().fill(unread ? Color.accentColor : .clear).frame(width: 8, height: 8).padding(.top, 6)
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text(conversation.participants.map(session.personaName).joined(separator: ", "))
-                        .font(.body.weight(unread ? .semibold : .regular))
-                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        if conversation.external != nil { Image(systemName: "at").font(.caption) }
+                        Text(conversation.external.map { session.interStem.label($0.address) }
+                             ?? conversation.participants.map(session.personaName).joined(separator: ", "))
+                            .font(.body.weight(unread ? .semibold : .regular))
+                            .lineLimit(1)
+                    }
                     Spacer()
                     Text(RelativeTime.short(conversation.updatedAt)).font(.caption).foregroundStyle(.secondary)
                 }
@@ -127,6 +145,8 @@ struct MailConversationView: View {
     @Environment(Session.self) private var session
     let conversationId: String
     @State private var showAdd = false
+    /// The name being typed for the other person (nil: the alert is closed).
+    @State private var naming: String?
     /// The open Reply sheet; `focus` when a form's Ask opened it.
     @State private var replying: ReplyRequest?
     /// Mails the user opened or folded, flipping their default (see MailThread.layout).
@@ -158,6 +178,16 @@ struct MailConversationView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     if let c = conversation { header(c) }
+                    if let ext = conversation?.external {
+                        PersonBanners(address: ext.address)
+                        CollabCard(collab: conversation?.collab, turn: Self.turn(items, ext.address),
+                                   who: session.interStem.label(ext.address))
+                    }
+                    // A draft answers their mail: offered once they have written.
+                    if let ext = conversation?.external, items.contains(where: { $0.from == ext.address }) {
+                        ExternalDraftBar(conversationId: conversationId, address: ext.address, working: working,
+                                         held: items.contains { $0.external?.held == true })
+                    }
                     if working { liveRow }
                     if !layout.trailing.isEmpty { exchange(key: "trailing", layout.trailing, author: lead) }
                     ForEach(layout.entries) { entry in
@@ -228,13 +258,33 @@ struct MailConversationView: View {
                             Label("Stop", systemImage: "stop.circle")
                         }
                     }
-                    Button { showAdd = true } label: { Label("Add a persona", systemImage: "person.badge.plus") }
+                    if let ext = conversation?.external {
+                        Button { naming = session.interStem.contact(ext.address)?.name ?? "" } label: {
+                            Label("Name them…", systemImage: "pencil")
+                        }
+                        if session.interStem.contact(ext.address)?.verifiedByUser == true {
+                            let on = session.interStem.contact(ext.address)?.autoDraft == true
+                            Button { Task { await session.interStem.setAutoDraft(ext.address, !on) } } label: {
+                                Label(on ? "Turn off auto-draft" : "Auto-draft their mail", systemImage: "sparkles")
+                            }
+                        }
+                    } else {
+                        Button { showAdd = true } label: { Label("Add a persona", systemImage: "person.badge.plus") }
+                    }
                     Button { Task { await session.mail.setArchived([conversationId], true) } } label: {
                         Label("Archive", systemImage: "archivebox")
                     }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
+        .alert("Their name", isPresented: Binding(get: { naming != nil }, set: { if !$0 { naming = nil } })) {
+            TextField("Name", text: Binding(get: { naming ?? "" }, set: { naming = $0 }))
+            Button("Save") {
+                if let ext = conversation?.external, let name = naming { Task { await session.interStem.setName(ext.address, name) } }
+                naming = nil
+            }
+            Button("Cancel", role: .cancel) { naming = nil }
+        } message: { Text("Shown beside their address on this Stem only.") }
         .confirmationDialog("Add to this conversation", isPresented: $showAdd) {
             ForEach(session.mailPersonas.filter { !(conversation?.participants.contains($0.id) ?? false) }) { p in
                 Button(p.name) { Task { await session.mail.addParticipant(conversationId, persona: p.id) } }
@@ -252,13 +302,28 @@ struct MailConversationView: View {
         .onChange(of: conversation?.userUpdatedAt) { _, _ in Task { await markRead() } }
     }
 
+    /// Whose move it is in mail with another person: whoever did not write last.
+    static func turn(_ items: [MailItem], _ address: String) -> String? {
+        guard let last = items.last(where: { $0.from == address || ($0.from == "user" && $0.to.contains(address)) }) else { return nil }
+        return last.from == address ? "you" : "them"
+    }
+
     private func header(_ c: MailConversation) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(c.subject.isEmpty ? "(no subject)" : c.subject).font(.title3.bold())
             HStack(spacing: 8) {
-                let others = c.participants.dropFirst().map(session.personaName)
-                Text(([session.personaName(lead) + (others.isEmpty ? "" : " leads")] + others).joined(separator: " · "))
-                    .font(.footnote).foregroundStyle(.secondary)
+                if let ext = c.external {
+                    let contact = session.interStem.contact(ext.address)
+                    let named = contact?.name.map { "\($0) · \(ext.address)" } ?? ext.address
+                    let trust = contact?.verifiedByUser == true ? "verified by you"
+                        : (contact?.keyFp.isEmpty ?? true) ? "not on Stem yet" : "verified by email"
+                    Text("\(named) · \(trust)")
+                        .font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                } else {
+                    let others = c.participants.dropFirst().map(session.personaName)
+                    Text(([session.personaName(lead) + (others.isEmpty ? "" : " leads")] + others).joined(separator: " · "))
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 if c.status == "awaiting-user" { pill("Waiting on you", .orange) }
                 if c.status == "failed" { pill("Failed", .red) }
                 if c.status == "aborted" { pill("Stopped", .secondary) }
@@ -387,7 +452,7 @@ struct MailReplySheet: View {
     private var items: [MailItem] { session.mail.items(conversationId) }
     /// A run parked on Allow/Deny takes the reply instead of the lead.
     private var parkedBy: String? { items.last { $0.approval?.status == "pending" }?.from }
-    private var recipient: String { parkedBy ?? conversation?.participants.first ?? "normal" }
+    private var recipient: String { conversation?.external?.address ?? parkedBy ?? conversation?.participants.first ?? "normal" }
     private var quoted: MailItem? { items.last { $0.from != "user" && $0.to.contains("user") } }
 
     var body: some View {
@@ -400,15 +465,16 @@ struct MailReplySheet: View {
                             .padding(.horizontal, 10).padding(.vertical, 2)
                             .background(Color.accentColor.opacity(0.12), in: Capsule())
                             .overlay(Capsule().strokeBorder(Color.accentColor))
-                        let others = (conversation?.participants ?? []).filter { $0 != recipient }.map(session.personaName)
-                        if parkedBy != nil {
+                        let others = conversation?.external != nil ? []
+                            : (conversation?.participants ?? []).filter { $0 != recipient }.map(session.personaName)
+                        if parkedBy != nil, conversation?.external == nil {
                             Text("instead of its Allow or Deny").font(.footnote).foregroundStyle(.secondary)
                         } else if !others.isEmpty {
                             Text("\(others.joined(separator: ", ")) only if \(session.personaName(recipient)) asks")
                                 .font(.footnote).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
-                    if conversation?.status == "working" {
+                    if conversation?.status == "working", conversation?.external == nil {
                         Text("\(session.personaName(recipient)) reads this when its current run ends.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
@@ -491,9 +557,24 @@ struct MailItemCard: View {
             if item.filed == true {
                 Text("Arrived after the answer — filed without starting another turn").font(.caption).foregroundStyle(.secondary)
             }
-            MarkdownView(item.body)
-            if let approval = item.approval { MailApprovalView(itemId: item.id, approval: approval) }
+            if let label = item.external?.statusLabel {
+                Text(label).font(.caption.weight(.medium)).foregroundStyle(statusColor(item.external?.status))
+            }
+            if item.external?.held == true { HeldNote(item: item) }
+            // A send draft's text is the editable box below, not a second copy here.
+            // Another person's words are shown as they wrote them, not rendered.
+            if item.from.contains("@") { Text(item.body).textSelection(.enabled) }
+            else if item.approval?.kind != "send" { MarkdownView(item.body) }
+            if let x = item.external, x.error != nil || x.status == "joined", x.status != "sent", x.status != "delivered" {
+                SendStateRow(item: item, external: x)
+            }
+            if let approval = item.approval {
+                if approval.kind == "send" { SendDraftView(itemId: item.id, approval: approval) }
+                else { MailApprovalView(itemId: item.id, approval: approval) }
+            }
             AttachmentStrip(attachments: item.attachments ?? [])
+            let files = (item.attachments ?? []).filter { $0.fileId != nil }
+            if !files.isEmpty { MailFilesRow(files: files) }
             ForEach(item.images ?? [], id: \.id) { ref in GeneratedImage(ref: ref, store: nil, client: session.client) }
         }
         .padding(12)
@@ -503,6 +584,313 @@ struct MailItemCard: View {
         .contextMenu {
             Button("Copy") { UIPasteboard.general.string = item.body }
             if let onShare { Button("Share as Link…", systemImage: "square.and.arrow.up") { onShare() } }
+        }
+    }
+}
+
+private func statusColor(_ status: String?) -> Color {
+    switch status {
+    case "delivered", "joined": return .green
+    case "failed", "unreachable": return .red
+    case "key-changed", "expired", "waiting": return .orange
+    default: return .secondary
+    }
+}
+
+/// Files in mail with another person: tap to fetch and preview (Share is in the preview).
+struct MailFilesRow: View {
+    @Environment(Session.self) private var session
+    let files: [MessageAttachment]
+    @State private var preview: URL?
+    @State private var busy: String?
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(files, id: \.fileId) { f in
+                Button {
+                    open(f)
+                } label: {
+                    HStack(spacing: 6) {
+                        if busy == f.fileId { ProgressView().controlSize(.mini) } else { Image(systemName: "arrow.down.doc") }
+                        Text(f.name ?? "File").lineLimit(1)
+                        if let size = f.size {
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)).foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(busy != nil)
+            }
+            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+        }
+        .quickLookPreview($preview)
+    }
+
+    private func open(_ f: MessageAttachment) {
+        guard let id = f.fileId else { return }
+        busy = id
+        error = nil
+        Task {
+            do { preview = try await session.client.download("stem-mailfile:\(id)", name: f.name ?? "file") } catch { self.error = error.localizedDescription }
+            busy = nil
+        }
+    }
+}
+
+/// Where a conversation with another person stands, folded to its goal line on tap.
+struct CollabCard: View {
+    let collab: MailCollab?
+    let turn: String?
+    let who: String
+    @State private var open = true
+
+    var body: some View {
+        if collab != nil || turn != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                Button { withAnimation { open.toggle() } } label: {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(collab?.goal ?? "Mail with them").font(.subheadline.weight(.semibold)).multilineTextAlignment(.leading)
+                        Spacer()
+                        if let turn {
+                            Text(turn == "you" ? "Your turn" : "Waiting on \(who)")
+                                .font(.caption.weight(turn == "you" ? .semibold : .regular))
+                                .foregroundStyle(turn == "you" ? Color.accentColor : .secondary)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                if open, let c = collab {
+                    if !c.agreed.isEmpty { section("Agreed", c.agreed, mark: "checkmark") }
+                    if !c.open.isEmpty { section("Open", c.open, mark: "circle") }
+                    if let next = c.next, !next.isEmpty {
+                        (Text("NEXT  ").font(.caption2).foregroundStyle(.secondary) + Text(next).font(.caption))
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private func section(_ title: String, _ lines: [String], mark: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased()).font(.caption2).foregroundStyle(.secondary)
+            ForEach(lines, id: \.self) { l in
+                Label(l, systemImage: mark).font(.caption).labelStyle(.titleAndIcon)
+            }
+        }
+    }
+}
+
+/// Held mail from another person: only the user sees it until they let their agents read it.
+struct HeldNote: View {
+    @Environment(Session.self) private var session
+    let item: MailItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Only you can see this. Your agents can’t read it until you let them.", systemImage: "lock")
+                .font(.caption)
+            Button("Only let them read it") { Task { await session.interStem.release(item.conversationId, item.id) } }
+                .font(.caption).buttonStyle(.bordered).controlSize(.small)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Why a mail to a person didn't go (yet), with what the user can do about it.
+struct SendStateRow: View {
+    @Environment(Session.self) private var session
+    let item: MailItem
+    let external: MailItemExternal
+    @State private var invited = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(external.status == "joined" ? "\(session.personaName(item.to.first ?? "")) is on Stem now. Send it?" : external.error ?? "")
+                .font(.caption).foregroundStyle(statusColor(external.status))
+            HStack {
+                if external.status == "waiting" || external.status == "unreachable", let to = item.to.first {
+                    Button(invited ? "Invite sent" : "Invite them") {
+                        invited = true
+                        Task { await session.interStem.invite(to) }
+                    }
+                    .disabled(invited)
+                    .buttonStyle(.bordered)
+                }
+                if item.from == "user", external.resendable {
+                    Button(external.status == "joined" ? "Send now" : "Send again") {
+                        Task { await session.interStem.resend(item.conversationId, item.id) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .controlSize(.small)
+        }
+    }
+}
+
+/// Accept / Block for a first mail, and the loud notice when their key changed.
+struct PersonBanners: View {
+    @Environment(Session.self) private var session
+    let address: String
+
+    var body: some View {
+        let c = session.interStem.contact(address)
+        if c?.state == "request" {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(session.interStem.label(address)) wrote to you for the first time.").font(.subheadline)
+                HStack {
+                    Button("Accept") { Task { await session.interStem.contactOp("accept", address) } }.buttonStyle(.borderedProminent)
+                    Button("Block", role: .destructive) { Task { await session.interStem.contactOp("block", address) } }.buttonStyle(.bordered)
+                }
+                .controlSize(.small)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        }
+        if c?.keyChanged == true {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("\(address)’s key changed — a new device, or someone else. Check with them another way before you send anything.",
+                      systemImage: "key").font(.subheadline).foregroundStyle(.orange)
+                Button("It’s them — use the new key") { Task { await session.interStem.contactOp("ackKey", address) } }
+                    .buttonStyle(.bordered).controlSize(.small)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+        }
+        if let error = session.interStem.error {
+            ErrorBanner(text: error) { session.interStem.error = nil }
+        }
+    }
+}
+
+/// Ask a persona to draft the next reply to a person. With held mail, the tap
+/// is also the release: the agents read it, then draft.
+struct ExternalDraftBar: View {
+    @Environment(Session.self) private var session
+    let conversationId: String
+    let address: String
+    let working: Bool
+    let held: Bool
+    @State private var persona: String?
+    @State private var instructions = ""
+    @State private var busy = false
+    @State private var error: String?
+
+    private var chosen: String {
+        persona ?? session.interStem.contact(address)?.draftPersona.flatMap { id in
+            session.mailPersonas.contains { $0.id == id } ? id : nil
+        } ?? (session.mailPersonas.contains { $0.id == "normal" } ? "normal" : session.mailPersonas.first?.id ?? "normal")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "sparkles").foregroundStyle(Color.accentColor)
+                Menu {
+                    ForEach(session.mailPersonas) { p in Button(p.name) { persona = p.id } }
+                } label: {
+                    Text(session.personaName(chosen)).font(.subheadline.weight(.semibold))
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                }
+                Spacer()
+            }
+            TextField("What should the reply say? (optional)", text: $instructions, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .font(.subheadline)
+            Button {
+                draft()
+            } label: {
+                Label(held ? "Read it and draft a reply" : "Draft a reply", systemImage: "sparkles")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(busy || working)
+            if working { Text("A draft is being written…").font(.caption).foregroundStyle(.secondary) }
+            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+        }
+        .padding(12)
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.secondary.opacity(0.25)))
+    }
+
+    private func draft() {
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await session.interStem.draft(conversationId, persona: chosen, instructions: instructions, release: held)
+                instructions = ""
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+}
+
+/// A persona's draft to another person: the exact text that would go out,
+/// editable. Nothing reaches them until the user presses Send.
+struct SendDraftView: View {
+    @Environment(Session.self) private var session
+    let itemId: String
+    let approval: MailApproval
+    @State private var text: String
+    @State private var busy = false
+
+    init(itemId: String, approval: MailApproval) {
+        self.itemId = itemId
+        self.approval = approval
+        _text = State(initialValue: approval.command)
+    }
+
+    private var settled: String {
+        switch approval.status {
+        case "allowed": return "You sent it to \(approval.to ?? "them")."
+        case "superseded": return "You wrote your own reply instead."
+        default: return "You discarded this draft."
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if approval.status == "pending" {
+                Label("Send this to \(approval.to ?? "them")?", systemImage: "paperplane")
+                    .font(.subheadline.weight(.semibold))
+                TextEditor(text: $text)
+                    .font(.body)
+                    .frame(minHeight: 120)
+                    .padding(4)
+                    .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityLabel("The draft — edit before sending")
+                Text("This is exactly what they will receive.").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Discard", role: .destructive) { answer(false) }.buttonStyle(.bordered)
+                    Spacer()
+                    Button { answer(true) } label: { Label("Send", systemImage: "paperplane.fill") }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .disabled(busy)
+            } else {
+                Text(settled).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func answer(_ send: Bool) {
+        busy = true
+        Task {
+            await session.mail.resolveApproval(itemId, allow: send, body: send ? text : nil)
+            busy = false
         }
     }
 }
@@ -558,11 +946,31 @@ struct MailComposeView: View {
     var onSent: (String) -> Void
     @State private var draft = DraftStore.load("mail:new")
     @State private var error: String?
+    @State private var reach: InterStemReach?
+    @State private var invited: String?
+    @State private var from: String?
+
+    private var writingOut: Bool { draft.outTo != nil }
+    private var outAddress: String { (draft.outTo ?? "").trimmingCharacters(in: .whitespaces).lowercased() }
+    private var outLooksValid: Bool { outAddress.wholeMatch(of: /[^\s@]+@[^\s@]+\.[^\s@]+/) != nil }
+    private var outSendable: Bool { outLooksValid && (reach == nil || reach?.state == "reachable" || reach?.state == "unreachable") }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 Form {
+                    if session.interStem.canWriteOut {
+                        Section {
+                            Toggle(isOn: Binding(get: { writingOut }, set: { draft.outTo = $0 ? (draft.outTo ?? "") : nil })) {
+                                Label("To a person", systemImage: "at")
+                            }
+                        } footer: {
+                            if writingOut { Text("To someone on their own Stem, by email address. End-to-end encrypted; only you send.") }
+                        }
+                    }
+                    if writingOut {
+                        personSection
+                    } else {
                     Section {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("To — the first one leads").font(.caption).foregroundStyle(.secondary)
@@ -587,20 +995,82 @@ struct MailComposeView: View {
                         TextField("Subject", text: $draft.subject)
                         Toggle(isOn: $draft.isPrivate) { Label("Private", systemImage: "eye.slash") }
                     }
+                    }
                     if let error { Section { Text(error).foregroundStyle(.red).font(.footnote) } }
                 }
                 .scrollDismissesKeyboard(.interactively)
-                Composer(kind: .mail, draftKey: "mail:new", draft: $draft, placeholder: "Write your mail", onSend: send)
+                Composer(kind: .mail, draftKey: "mail:new", draft: $draft, busy: writingOut && !outSendable,
+                         placeholder: "Write your mail", onSend: send)
             }
             .navigationTitle("New mail")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
             .onChange(of: draft) { _, d in DraftStore.save("mail:new", d) }
             .onAppear { if draft.to.isEmpty, session.mailPersonas.contains(where: { $0.id == "normal" }) { draft.to = ["normal"] } }
+            .task(id: outAddress) {
+                reach = nil
+                guard writingOut, outLooksValid else { return }
+                // Lookups are rate-limited on the relay: wait for a pause in typing.
+                try? await Task.sleep(for: .milliseconds(700))
+                guard !Task.isCancelled else { return }
+                reach = try? await session.interStem.lookup(outAddress)
+            }
+        }
+    }
+
+    @ViewBuilder private var personSection: some View {
+        Section {
+            if session.interStem.verifiedAddresses.count > 1 {
+                Picker("From", selection: Binding(get: { from ?? session.interStem.verifiedAddresses[0] }, set: { from = $0 })) {
+                    ForEach(session.interStem.verifiedAddresses, id: \.self) { Text($0).tag($0) }
+                }
+            }
+            TextField("their@email.com", text: Binding(get: { draft.outTo ?? "" }, set: { draft.outTo = $0 }))
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            let matches = (session.interStem.status?.contacts ?? []).filter {
+                $0.state != "blocked" && $0.address != outAddress && (outAddress.isEmpty || $0.address.contains(outAddress)
+                    || ($0.name ?? "").lowercased().contains(outAddress))
+            }.prefix(5)
+            if !matches.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(Array(matches)) { c in
+                            Button(c.name ?? c.address) { draft.outTo = c.address }.chipStyle(on: false)
+                        }
+                    }
+                    .font(.subheadline)
+                }
+            }
+            if let reach, outLooksValid { reachRow(reach) }
+            TextField("Subject (optional)", text: $draft.subject)
+        }
+    }
+
+    @ViewBuilder private func reachRow(_ r: InterStemReach) -> some View {
+        switch r.state {
+        case "reachable":
+            Label("On Stem", systemImage: "checkmark").font(.footnote).foregroundStyle(.green)
+        case "unreachable":
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Not on Stem yet. Your mail waits here, and Stem tells you when it can reach them.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button(invited == outAddress ? "Invite sent" : "Invite them") {
+                    invited = outAddress
+                    Task { await session.interStem.invite(outAddress) }
+                }
+                .disabled(invited == outAddress)
+                .buttonStyle(.bordered).controlSize(.small)
+            }
+        case "self": Text("That’s your own address.").font(.footnote).foregroundStyle(.red)
+        case "blocked": Text("You blocked them. Unblock them on the desktop first.").font(.footnote).foregroundStyle(.red)
+        default: Text(r.reason ?? "This address can’t be mailed.").font(.footnote).foregroundStyle(.red)
         }
     }
 
     private func send(_ text: String, _ files: [DraftAttachment]) async -> Bool {
+        if writingOut { return await sendToPerson(text, files) }
         do {
             let uploads = try await Uploads.upload(files, client: session.client)
             let input = MailComposeInput(
@@ -611,6 +1081,26 @@ struct MailComposeView: View {
             let created = r.conversations.filter { !before.contains($0.id) }.max { $0.createdAt < $1.createdAt }
             draft.subject = ""
             draft.isPrivate = false
+            DraftStore.clear("mail:new", draft)
+            dismiss()
+            if let created { onSent(created.id) }
+            return true
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
+    }
+
+    private func sendToPerson(_ text: String, _ files: [DraftAttachment]) async -> Bool {
+        guard outSendable else { return false }
+        do {
+            let before = Set(session.mail.mail.conversations.map(\.id))
+            let uploads = try await Uploads.upload(files, client: session.client)
+            try await session.interStem.compose(to: outAddress, from: from, subject: draft.subject, body: text, attachments: uploads)
+            await session.mail.reload()
+            let created = session.mail.mail.conversations.filter { !before.contains($0.id) }.max { $0.createdAt < $1.createdAt }
+            draft.subject = ""
+            draft.outTo = nil
             DraftStore.clear("mail:new", draft)
             dismiss()
             if let created { onSent(created.id) }

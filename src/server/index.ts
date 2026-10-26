@@ -36,7 +36,8 @@ import type { TaskScheduler } from './scheduler';
 import { MailRouter } from './mail/router';
 import { answerMemoryCheck } from './recall/deep-check';
 import { nameAfterFirstReply, runMailSubjectPass, type MailSubjectDeps } from './mail/subject';
-import { onPersonasChanged, resolveClientPersona } from './workspace/personas';
+import { getPersona, onPersonasChanged, resolveClientPersona } from './workspace/personas';
+import { contactMemoryScheduler } from './interstem/contact-memory';
 import { personaTurnFields } from './workspace/persona-turn';
 import { initTaskScheduler } from './startup/scheduler';
 import { repointRetiredPersonas } from './startup/retired-personas';
@@ -64,7 +65,7 @@ import {
 import { setActivityEmitter } from './activity';
 import { foldTurnEvent, liveTurnCount, noteTurnStart } from './live-turns';
 import { startTurnOnce } from './start-turn-once';
-import { pushApprovalRequest, pushMailReceived, pushTurnFinished, type ApprovalPushKind } from './push';
+import { pushApprovalRequest, pushMailReceived, pushPersonMail, pushTurnFinished, type ApprovalPushKind } from './push';
 import { mailConversationFor, onMailChanged, onMailReceived, taskMailHistory, taskRunThreadIds } from './workspace/mail';
 import { closeApns } from './push/apns';
 import { closeDeviceMcpRouter } from './mcp-device/router';
@@ -423,6 +424,13 @@ function registerIpc(): void {
   registerShareIpc({ runtime: () => runtime!, interStem: () => interStem });
   registerMemoryCheckIpc({ router: () => mailRouter, runtime: () => runtime!, emit });
   onMailChanged(() => emit('mail:changed', undefined));
+  // What is learned from mail with other people, tagged with their address
+  // (interstem/contact-memory.ts): a while after mail changed.
+  const contactMemory = contactMemoryScheduler({
+    llm: () => (runtime ? memoryCheckLlm(() => runtime!) : null),
+    enabled: () => isRecallEnabled()
+  });
+  onMailChanged(() => contactMemory.schedule());
   onMailWorkChanged((event) => emit('mail:workChanged', event));
   onMailReceived(pushMailReceived);
   // The first reply in a conversation is its cue to trade a made-up subject
@@ -842,7 +850,25 @@ export async function startServer(opts: ServerOptions): Promise<ServerHandle> {
   // The mail router: turns MailItems into persona turns and settled turns back
   // into reply mail. Created with the runtime; the IPC layer reaches it through
   // the late-bound getter registerIpc wires.
-  interStem = new InterStemService({ onChange: () => emit('interstem:changed', undefined) });
+  interStem = new InterStemService({
+    onChange: () => emit('interstem:changed', undefined),
+    // A person wrote: the desktop shows a notification, the phone gets a push
+    // naming them (the push path decides whether a label may travel).
+    onMail: ({ conversationId, from, name, subject }) => {
+      emit('interstem:mail', { conversationId, from, ...(name ? { name } : {}), ...(subject ? { subject } : {}) });
+      pushPersonMail(conversationId, name ? `${name} <${from}>` : from);
+    },
+    onJoined: ({ conversationId, address }) => {
+      emit('interstem:mail', { conversationId, from: address, joined: true });
+    },
+    // A verified contact with auto-draft on: release their mail and draft at once.
+    onAutoDraft: (conversationId, itemId, personaId) => {
+      void (async () => {
+        const chosen = personaId && (await getPersona(personaId)) ? personaId : 'normal';
+        await mailRouter?.draftExternal(conversationId, chosen, '', { auto: { itemId } });
+      })().catch((e) => degrade('interstem', 'could not start an automatic draft', e));
+    }
+  });
   mailRouter = new MailRouter({
     runtime,
     onChange: () => emit('mail:changed', undefined),

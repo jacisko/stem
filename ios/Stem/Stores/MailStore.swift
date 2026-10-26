@@ -117,10 +117,12 @@ final class MailStore {
     func delete(_ id: String) async { await mutate("mail:delete", [.string(id)]) }
 
     /// Allow or deny a parked run's command; the answer resumes it on the server.
-    func resolveApproval(_ itemId: String, allow: Bool) async {
+    /// For a send draft, `body` is the (possibly edited) text that goes out.
+    func resolveApproval(_ itemId: String, allow: Bool, body: String? = nil) async {
         do {
-            let r = try await client.call("mail:resolveApproval", [.string(itemId), .string(allow ? "allow" : "deny")],
-                                          as: MailApprovalResult.self)
+            var args: [JSONValue] = [.string(itemId), .string(allow ? "allow" : "deny")]
+            if let body { args.append(.string(body)) }
+            let r = try await client.call("mail:resolveApproval", args, as: MailApprovalResult.self)
             if !r.ok { self.error = r.error ?? "That approval could not be answered." }
         } catch { self.error = error.localizedDescription }
         await reload()

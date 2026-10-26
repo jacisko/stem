@@ -105,9 +105,17 @@ Return ONLY JSON {"verdict":"compatible"|"contradicts"|"a_supersedes_b"|"b_super
   }
 }
 
-/** Folder facts merge only within their own folder: disconnecting it must still take exactly its facts. */
+/**
+ * Folder facts merge only within their own folder: disconnecting it must still
+ * take exactly its facts. Facts learned from mail with a person stay theirs.
+ */
 function mergeClass(source: string): string {
-  return source.startsWith('folder:') ? source : 'chat';
+  return source.startsWith('folder:') || source.startsWith('contact:') ? source : 'chat';
+}
+
+/** Which memory a fact belongs to: one person's (mail with them) or the user's own. Relations never cross. */
+function memoryScope(source: string | undefined): string {
+  return source?.startsWith('contact:') ? source : 'user';
 }
 
 /** Every evidence row is restated web content: the weakest authority a fact can have. */
@@ -303,8 +311,10 @@ export async function sweepFactAgainstNeighbours(
   if (!fresh || (fresh.status !== 'active' && fresh.status !== 'conflicted')) return true;
   const activeIds = opts.prefetched?.activeIds
     ?? new Set(getAllFacts().filter((f) => f.status === 'active').map((f) => f.id));
+  const scope = memoryScope(fresh.source);
   const targets = neighbourIdsOf(factId, opts.prefetched?.vectors ?? getFactVectors(model), activeIds)
     .filter((id) => !opts.skipIds?.has(id))
+    .filter((id) => memoryScope(getFactDetails(id)?.source) === scope)
     .filter((id) => !isRelationChecked(factId, id));
   for (const targetId of targets) {
     if (opts.budget && opts.budget.remaining <= 0) {
@@ -447,11 +457,13 @@ export async function enqueueNeighbourChecksFor(factIds: number[]): Promise<numb
     missing.forEach((f, i) => upsertFactVectorForSnapshot(f.id, f.text, factsGeneration, model, vecs[i]));
   }
   const vectors = getFactVectors(model);
-  const activeIds = new Set(getAllFacts().filter((f) => f.status === 'active').map((f) => f.id));
+  const activeFacts = getAllFacts().filter((f) => f.status === 'active');
+  const activeIds = new Set(activeFacts.map((f) => f.id));
+  const scopeOf = new Map(activeFacts.map((f) => [f.id, memoryScope(f.source)]));
   const pairs: Array<[number, number]> = [];
   for (const id of factIds) {
     if (!activeIds.has(id)) continue;
-    for (const nid of neighbourIdsOf(id, vectors, activeIds)) pairs.push([id, nid]);
+    for (const nid of neighbourIdsOf(id, vectors, activeIds)) if (scopeOf.get(nid) === scopeOf.get(id)) pairs.push([id, nid]);
   }
   return pairs.length > 0 ? enqueueRelationChecks(pairs, 'sweep') : 0;
 }

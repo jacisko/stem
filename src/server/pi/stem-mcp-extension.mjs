@@ -1267,6 +1267,20 @@ export function recallToolRefusal(serverName, toolName, turnCtx) {
   return RECALL_OFF_REFUSAL;
 }
 
+/**
+ * search_facts carries the turn's contact (mail with another person) so facts
+ * learned from them answer only there. Always set from the gate, never from
+ * the model: whatever it passed is overwritten.
+ */
+export function recallToolParams(serverName, toolName, params, turnCtx) {
+  const out = { ...(params || {}) };
+  delete out.__contact;
+  if (serverName === RECALL_SERVER_NAME && toolName === 'search_facts') {
+    out.__contact = turnCtx && typeof turnCtx.contact === 'string' ? turnCtx.contact : null;
+  }
+  return out;
+}
+
 const RECALL_MEMORY_TOOLS = new Set(['search_facts', 'search_past_chats', 'search_chat_summaries', 'search_folder_docs']);
 
 const RECALL_OFF_REFUSAL =
@@ -1291,7 +1305,7 @@ function registerNativeMcpTool(pi, name, spec, client, tool, protectedRoots, tur
       }
       const offending = protectedRoots ? findProtectedPath(params || {}, protectedRoots()) : null;
       if (offending) return errText(protectedPathRefusal(offending));
-      const result = await client.callTool(tool.name, params || {});
+      const result = await client.callTool(tool.name, recallToolParams(name, tool.name, params, turnContext ? turnContext() : null));
       const content = Array.isArray(result && result.content)
         ? result.content
         : [{ type: 'text', text: JSON.stringify(result ?? null) }];

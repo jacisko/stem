@@ -413,7 +413,7 @@ export function knownFactsBlock(context?: string, charBudget = KNOWN_FACTS_CHAR_
   const add = (facts: Array<{ id: number; source: string; text: string }>) => {
     for (const f of facts) {
       if (picked.length >= KNOWN_FACTS_CAP) break;
-      if (seen.has(f.id)) continue;
+      if (seen.has(f.id) || f.source.startsWith('contact:')) continue;
       const line = `- [fact:${f.id} source:${f.source}] ${escapeTranscriptMarkers(f.text)}`;
       // Relevance-picked facts run first, so the budget drops the recency
       // filler before it ever drops a likely-duplicate's dedup hint.

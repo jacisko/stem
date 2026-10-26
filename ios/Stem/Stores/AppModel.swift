@@ -118,6 +118,7 @@ final class Session {
     let connection: Connection
     let chats: ChatListStore
     let mail: MailStore
+    let interStem: InterStemStore
     let approvals: ApprovalStore
     private(set) var personas: [Persona] = []
     private(set) var models: [ModelSummary] = []
@@ -135,10 +136,12 @@ final class Session {
         connection = Connection(client: client)
         chats = ChatListStore(client: client)
         mail = MailStore(client: client)
+        interStem = InterStemStore(client: client)
         approvals = ApprovalStore(client: client)
         sub = connection.subscribe { [weak self] e in self?.on(e) }
         chats.attach(connection)
         mail.attach(connection)
+        interStem.attach(connection)
         approvals.attach(connection)
         connection.start()
     }
@@ -155,6 +158,8 @@ final class Session {
         if id == "user" { return "You" }
         if id.hasPrefix("task:") { return "Scheduled task" }
         if id == "memory-check" { return "Memory check" }
+        // Another person, by email address: the name the user gave them, if any.
+        if id.contains("@") { return interStem.label(id) }
         // An agent (`<roleId>~<name>`) reads as its name and its role.
         if let sep = id.range(of: "~", options: .backwards), sep.lowerBound > id.startIndex {
             let name = String(id[sep.upperBound...])

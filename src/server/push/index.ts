@@ -1,4 +1,5 @@
 import { degrade } from '../degrade';
+import { isExternalAddress } from '../../shared/types';
 import { log } from '../log';
 import { devicesWithPushTokens, setDevicePushToken, type DeviceRecord } from '../transport/auth';
 import { apnsConfigured, sendApns } from './apns';
@@ -56,6 +57,8 @@ export interface WakeUp {
   approvalKind?: ApprovalPushKind;
   /** Turns: whether it landed or failed. */
   failed?: boolean;
+  /** Mail: from another person (inter-Stem), not a persona. */
+  person?: boolean;
 }
 
 /**
@@ -103,7 +106,10 @@ function phrasing(wake: WakeUp): { title: string; fallback: string } {
       ? { title: 'A turn stopped', fallback: 'A turn you started did not finish.' }
       : { title: 'Stem finished', fallback: 'A turn you started has finished.' };
   }
-  if (wake.kind === 'mail') return { title: 'New Stem mail', fallback: 'A persona has mail for you.' };
+  if (wake.kind === 'mail')
+    return wake.person
+      ? { title: 'New mail', fallback: 'Someone wrote to you on Stem.' }
+      : { title: 'New Stem mail', fallback: 'A persona has mail for you.' };
   return { title: 'Task alert', fallback: 'A scheduled task has something for you.' };
 }
 
@@ -272,5 +278,16 @@ export function pushTaskAlert(task: { threadId: string; conversationId?: string;
  * its existing notification policy and channel, avoiding duplicate alerts. */
 export function pushMailReceived(item: { conversationId: string; from: string; to: string[]; taskId?: string }): void {
   if (item.from === 'user' || !item.to.includes('user') || item.taskId) return;
+  // Another person's mail says who wrote (pushPersonMail), not "a persona".
+  if (isExternalAddress(item.from)) return;
   fireAndForget({ kind: 'mail', conversationId: item.conversationId });
+}
+
+/**
+ * Mail from another person. The label is who wrote — never the subject or the
+ * text, which is theirs and sealed end to end. Through the relay's gateway no
+ * label travels at all, and the fixed wording stands.
+ */
+export function pushPersonMail(conversationId: string, sender: string): void {
+  fireAndForget({ kind: 'mail', conversationId, person: true }, `From ${sender}`);
 }

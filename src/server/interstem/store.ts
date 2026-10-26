@@ -40,6 +40,16 @@ export interface OutboxEntry {
   createdAt: number;
 }
 
+/** A mail to someone not (yet) on Stem: looked up now and then until they join. */
+export interface WaitingEntry {
+  mailItemId: string;
+  conversationId: string;
+  from: string;
+  to: string;
+  since: number;
+  checkedAt: number;
+}
+
 /** A sent envelope whose delivery status we may still learn (contacts only). */
 export interface SentEntry {
   envelopeId: string;
@@ -59,6 +69,7 @@ interface FileShape {
   contacts: Record<string, StoredContact>;
   outbox: OutboxEntry[];
   sent: SentEntry[];
+  waiting?: WaitingEntry[];
   /** Relay signing keys learned from /.well-known (kid → b64) when none ship built in. */
   relayKeys: Record<string, Record<string, string>>;
 }
@@ -71,6 +82,7 @@ export interface InterStemState {
   contacts: Record<string, StoredContact>;
   outbox: OutboxEntry[];
   sent: SentEntry[];
+  waiting: WaitingEntry[];
   relayKeys: Record<string, Record<string, string>>;
 }
 
@@ -107,6 +119,7 @@ function toState(f: FileShape): InterStemState {
     contacts: f.contacts && typeof f.contacts === 'object' ? f.contacts : {},
     outbox: Array.isArray(f.outbox) ? f.outbox : [],
     sent: Array.isArray(f.sent) ? f.sent : [],
+    waiting: Array.isArray(f.waiting) ? f.waiting : [],
     relayKeys: f.relayKeys && typeof f.relayKeys === 'object' ? f.relayKeys : {}
   };
 }
@@ -180,6 +193,7 @@ export function interStemStore(path: string = interStemStorePath()): InterStemSt
         contacts: s.contacts,
         outbox: s.outbox,
         sent: s.sent.slice(-2000),
+        waiting: s.waiting,
         relayKeys: s.relayKeys
       });
       return out;

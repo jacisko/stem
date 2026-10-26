@@ -1353,8 +1353,9 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
       if (input.mail) turn.mail = { conversationId: input.mail.conversationId, participants: input.mail.participants };
       // Inter-Stem external context: full memory to read, but nothing leaves
       // except the user-approved draft. Kept out of Recall too: content from
-      // outside must not become "facts about the user" (contact-tagged capture
-      // is a later step).
+      // outside must not become "facts about the user" (what is learned from
+      // them is extracted separately, tagged with their address:
+      // interstem/contact-memory.ts).
       if (input.mail?.external) {
         turn.external = true;
         this.taintTurn(turn);
@@ -1484,6 +1485,7 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
             // tools are off for the turn (codeRelayRefusal in the extension).
             relay: !!turn.personaHarness,
             external: turn.external === true,
+            contact: turn.external ? input.mail?.external?.address ?? null : null,
             imageGen: imageGen.ok && !turn.external,
             imageGenRefusal: imageGen.ok ? null : imageGen.refusal,
             // The persona's MCP allowlist; buildMessage filters the catalog
@@ -4931,6 +4933,8 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
       const injectedDocs: InjectedDocRef[] = [];
       const recall = await buildRecallContext(input.input, {
         currentThreadId: threadId,
+        // Mail with another person: what Stem learned from them joins the user's memory here, and only here.
+        contact: input.mail?.external?.address ?? null,
         timings: recallTimings,
         chosen,
         flags,

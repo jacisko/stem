@@ -1255,6 +1255,9 @@ export default function App() {
     [core, setThread, mutateInbox, updatedAtMap, noteChatOpened, refreshThreadHistory]
   );
 
+  // A clicked notification for another person's mail opens it.
+  useEffect(() => window.stem.onOpenMailConversation?.((id) => openMail(id)), [openMail]);
+
   // `stem://chat|mail/<id>` links in replies (read_past_chat hands them out).
   // A chat link that names a thread behind a mail conversation opens that
   // conversation: its hidden thread is not a chat the user can see.

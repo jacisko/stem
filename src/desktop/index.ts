@@ -7,6 +7,7 @@ import {
   ipcMain,
   nativeImage,
   nativeTheme,
+  Notification,
   powerMonitor,
   session,
   shell
@@ -309,6 +310,24 @@ function sendToMain(channel: string, payload: unknown): void {
 function liveQuickChatAccelerator(): string | null {
   const status = quickChat.shortcutStatus();
   return status.registered ? status.accelerator : null;
+}
+
+/**
+ * Another person's mail arrived: a system notification naming them, unless
+ * Stem is in front already (the Inbox shows it). Clicking opens it.
+ */
+function notifyPersonMail(mail: { conversationId: string; from: string; name?: string; subject?: string; joined?: boolean }): void {
+  if (E2E || !Notification.isSupported()) return;
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
+  const who = mail.name ? `${mail.name} (${mail.from})` : mail.from;
+  const n = mail.joined
+    ? new Notification({ title: `${who} is on Stem now`, body: 'Your mail to them is ready to send.' })
+    : new Notification({ title: who, body: mail.subject ? mail.subject : 'Wrote to you on Stem.' });
+  n.on('click', () => {
+    revealMainWindow();
+    sendToMain('mail:openConversation', { conversationId: mail.conversationId });
+  });
+  n.show();
 }
 
 /** Bring the main window to the front (recreating it if it was closed). */
@@ -638,6 +657,7 @@ app.whenReady().then(async () => {
     turnAbandoned: (turnId) => quickChat.abandonHudTurn(turnId),
     revealMainWindow,
     requestAttention: () => requestAttention(mainWindow),
+    notifyPersonMail,
     threadOpened: (threadId) => quickChat.threadOpened(threadId),
     applyQuickChatSettings: (patch, next) => {
       quickChat.applySettings(patch, next);

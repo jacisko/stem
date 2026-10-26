@@ -165,7 +165,7 @@ export function useMail(ready: boolean): MailApi {
     [applyServer]
   );
   const composeExternal = useCallback(
-    async (input: { to: string; subject?: string; body: string }) => {
+    async (input: { to: string; self?: string; subject?: string; body: string; attachments?: TurnAttachment[] }) => {
       const list = await window.stem.composeExternalMail(input);
       applyServer(list);
       return list;

@@ -323,6 +323,8 @@ export interface ProxyDeps {
   revealMainWindow(): void;
   /** OS-level attention nudge (dock bounce / taskbar flash). */
   requestAttention(): void;
+  /** A system notification for another person's mail (inter-Stem). */
+  notifyPersonMail?(mail: { conversationId: string; from: string; name?: string; subject?: string; joined?: boolean }): void;
   /** The implicit Quick Chat hand-off, run before a thread is opened. */
   threadOpened(threadId: string): Promise<void>;
   /**
@@ -1057,6 +1059,10 @@ export function createServerProxy(deps: ProxyDeps): ServerProxy {
         return;
       case 'client:requestAttention':
         deps.requestAttention();
+        return;
+      case 'interstem:mail':
+        deps.notifyPersonMail?.(payload as Parameters<NonNullable<typeof deps.notifyPersonMail>>[0]);
+        deps.sendToMain(channel, payload);
         return;
       // Approval cards: both surfaces mount them, and the overlay hides itself
       // while a turn runs — bring it back when the request belongs to its thread,

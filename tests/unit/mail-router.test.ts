@@ -3328,6 +3328,39 @@ describe('inter-Stem conversations', () => {
     expect(await router.recoverDroppedDeliveries()).toBe(0);
   });
 
+  it('carries the other person’s mark into a conversation their mail is forwarded to', async () => {
+    const fake = fakeBackend();
+    const { router } = externalRouter(fake);
+    const conversation = await inbound('Can you send the episode notes?');
+    const held = (await readMail()).items[0];
+    await expect(router.compose({ to: ['normal'], body: 'Fwd', forwardOf: held.id })).rejects.toThrow(/still held/);
+    const { releaseExternalItems } = await import('../../src/server/workspace/mail');
+    await releaseExternalItems(conversation.id, held.id);
+    fake.scriptsByPersona.normal = [{ mode: 'ok', reply: 'Noted.' }];
+    const result = await router.compose({ to: ['normal'], body: 'What do you make of this?', forwardOf: held.id });
+    const created = result.conversations.find((c) => c.id !== conversation.id)!;
+    expect(created.outside).toEqual({ address: martin });
+    await vi.waitFor(() => expect(fake.starts.length).toBeGreaterThan(0));
+    expect(fake.starts.at(-1)!.mail?.external).toEqual({ address: martin });
+  });
+
+  it('releases and drafts in one step when asked to', async () => {
+    const fake = fakeBackend();
+    const { router, sends } = externalRouter(fake);
+    const conversation = await inbound('Can you send the episode notes?');
+    fake.scriptsByPersona.normal = [
+      { mode: 'ok', reply: 'Draft saved.', bridge: async (bridge, ctx) => void (await bridge.send({ to: [martin], body: 'Notes attached.' }, ctx)) }
+    ];
+    const heldId = (await readMail()).items[0].id;
+    await expect(router.draftExternal(conversation.id, 'normal', '', { auto: { itemId: 'someone-else' } })).rejects.toThrow(/waits for you/);
+    await router.draftExternal(conversation.id, 'normal', '', { auto: { itemId: heldId } });
+    expect((await readMail()).items.some((i) => i.external?.held)).toBe(false);
+    await vi.waitFor(async () => expect((await readMail()).items.some((i) => i.approval?.kind === 'send')).toBe(true));
+    expect(fake.starts.at(-1)!.input).toContain('episode notes');
+    expect((await readMail()).items.find((i) => i.from === 'user' && i.to.includes('normal'))?.body).toMatch(/Automatic/);
+    expect(sends).toHaveLength(0);
+  });
+
   it('keeps held mail from agents, then drafts for approval without sending', async () => {
     const fake = fakeBackend();
     const { router, sends } = externalRouter(fake);
@@ -3378,6 +3411,11 @@ describe('inter-Stem conversations', () => {
     await vi.waitFor(async () => expect((await readMail()).conversations[0].status).not.toBe('working'));
     // The draft is the turn's answer: no second, implicit reply.
     expect((await readMail()).items.filter((i) => i.from === 'normal')).toHaveLength(1);
+
+    // Sending without the text (an older phone that showed it as a command) is refused, still pending.
+    expect((await router.resolveApproval(draft.id, 'allow')).ok).toBe(false);
+    expect((await readMail()).items.find((i) => i.id === draft.id)?.approval?.status).toBe('pending');
+    expect(sends).toHaveLength(0);
 
     const res = await router.resolveApproval(draft.id, 'allow', 'Here are the notes, edited.');
     expect(res.ok).toBe(true);

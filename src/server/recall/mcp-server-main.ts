@@ -171,10 +171,12 @@ async function searchPastChats(query: string, limit: unknown): Promise<CoreSearc
   });
 }
 
-async function searchFacts(query: string, limit: unknown): Promise<CoreFactHit[]> {
+async function searchFacts(query: string, limit: unknown, contact: unknown): Promise<CoreFactHit[]> {
   return hybridSearchFacts(open(), query, {
     limit: clampLimit(limit, 10, 30),
-    embedQuery: embedOnce(query)
+    embedQuery: embedOnce(query),
+    // Stamped by the bridge from the turn's gate (recallToolParams), never the model.
+    contact: typeof contact === 'string' && contact.includes('@') ? contact : null
   });
 }
 
@@ -357,7 +359,8 @@ interface RpcMessage {
   params?: {
     protocolVersion?: string;
     name?: string;
-    arguments?: { query?: unknown; limit?: unknown; folder?: unknown; page?: unknown };
+    /** `__contact`: stamped by the bridge on search_facts (recallToolParams), never by the model. */
+    arguments?: { query?: unknown; limit?: unknown; folder?: unknown; page?: unknown; __contact?: unknown };
   };
 }
 
@@ -531,7 +534,7 @@ function handle(msg: RpcMessage): void {
           const limit = params?.arguments?.limit;
           const text =
             name === 'search_facts'
-              ? formatFacts(await searchFacts(query, limit))
+              ? formatFacts(await searchFacts(query, limit, params?.arguments?.__contact))
               : name === 'search_chat_summaries'
                 ? formatSummaries(await searchSummaries(query, limit))
                 : name === 'search_folder_docs'

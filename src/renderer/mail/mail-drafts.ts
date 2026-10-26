@@ -23,6 +23,8 @@ export interface ComposeDraft {
   body: string;
   private: boolean;
   attachments: TurnAttachment[];
+  /** Set when the draft is to a person on their Stem: their email address. */
+  outTo?: string;
 }
 
 export const MAIL_DRAFTS_KEY = 'stem.mail.drafts';

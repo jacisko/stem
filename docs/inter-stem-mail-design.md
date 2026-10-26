@@ -2,7 +2,8 @@
 
 Status: decided 2026-10-13, revised the same day after review (discoverability,
 sender authentication) and after the Stem chat "Stem Inter-Stem Mail Design"
-(purpose, full memory by default). Nothing built. Builds on the mail system
+(purpose, full memory by default). Phase 1 built 2026-10-14; the practical
+pass of 2026-10-25 is under "Build notes (2026-10-25)". Builds on the mail system
 (`src/server/mail/router.ts`, `MailItem` in `src/shared/types.ts`) and the
 Inbox, which was groundwork for this from 0.4.0.
 
@@ -490,6 +491,53 @@ Where the first build is stricter or narrower than the design above:
   (`GLOBAL_RELAY_KEYS` in `relay-client.ts`). A relay named by
   `STEM_GLOBAL_RELAY_URL` brings its keys in `STEM_GLOBAL_RELAY_KEYS` or is
   learned from its `/.well-known` on first use and pinned.
+
+## Build notes (2026-10-25)
+
+What changed to make person mail practical, and where it differs from the
+sections above:
+
+- **Sending.** Contacts can be named; compose suggests them and checks
+  whether an address is on Stem as you type (cached ten minutes; lookups
+  are rate-limited). A From picker appears with several addresses.
+- **Not on Stem yet.** The mail is kept ("waiting") and looked up every
+  six hours for 30 days. When they join it shows "Ready to send" and the
+  user sends it with one click — offered, never sent blind. Failed and
+  unsent mail can be sent again. Replying to a Request accepts it.
+- **One step to a draft.** "Read it and draft a reply" releases the held
+  mail and starts the draft. The persona that drafted last for a contact
+  is the default.
+- **Auto-draft (per contact).** Only for a contact whose key the user
+  checked in person, and only while no key change is pending: their new
+  mail is released and drafted at once. Only the triggering mail is
+  released, and only when it is the one mail still held. Every send still
+  waits for the user. Unverifying, a key change or a first key pinned
+  after the check turns it off.
+- **Notifications.** A desktop notification names the sender; the phone
+  push says who wrote (through the relay's gateway no label travels).
+- **Memory.** Facts about the person and what was agreed are extracted
+  from released mail (and the user's own) into source `contact:<address>`
+  at confidence 0.75. They are injected and searchable only in turns with
+  that person (search_facts gets the contact stamped by the bridge from the
+  turn gate); the user summary, tidy, merges, neighbour sweeps, the deep
+  check and the distiller leave them out. Settings → contacts can forget
+  them. The user's own words in these conversations are still not captured
+  as user facts.
+- **Bringing mail to personas.** Forward works on released person mail;
+  the new conversation carries `outside: {address}`, so its turns are
+  external context. It can't be shared publicly, and it feeds no persona
+  notes or standing answers.
+- **Files.** Sealed inside the mail (17 MB in all; the relay takes 25 MB
+  sealed). Kept in a private mail-file store, fetched as
+  `GET /files/stem-mailfile:<id>`. Received pictures show inline only for
+  PNG/JPEG/GIF/WebP, from the raw bytes; nothing is converted before the
+  user looks. A persona sees files only when drafting after release.
+- **Collaboration card.** Goal, agreed, open and next, written by the
+  memory model from readable mail; whose turn it is comes from who wrote
+  last.
+- **Phone.** Requests, Accept/Block, key-change notice, held mail, drafts
+  with editing, send states, names, auto-draft, compose to a person,
+  files, the collaboration card. Forwarding is desktop only.
 
 ## Phases
 

@@ -4,6 +4,7 @@ import { registerServer, type CallerContext } from './guard';
 import type { MailRouter } from '../mail/router';
 import type { MailComposeInput, TurnAttachment } from '../../shared/types';
 import { transportedRawPath } from '../files/staging';
+import { removeMailFiles } from '../interstem/mail-files';
 import {
   deleteConversation,
   readMail,
@@ -71,7 +72,8 @@ export function registerMailIpc(deps: { router(): MailRouter | null; runtime(): 
   registerServer('mail:delete', async (_e, conversationId: string) => {
     await router().stopConversation(conversationId);
     await deleteRecordedWork(conversationId);
-    const { result, threadIds } = await deleteConversation(conversationId);
+    const { result, threadIds, fileIds } = await deleteConversation(conversationId);
+    await removeMailFiles(fileIds);
     // The hidden persona threads go with the conversation — they are its work
     // product, unreachable from anywhere else. Best-effort: a session file that
     // would not delete only costs disk, never correctness.

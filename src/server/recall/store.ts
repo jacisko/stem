@@ -101,6 +101,16 @@ export interface SearchOptions {
 }
 
 
+/** The `source` of facts learned from mail with `address` (inter-Stem). */
+export function contactSource(address: string | null | undefined): string {
+  return address ? `contact:${address}` : '';
+}
+
+/** True for a fact learned from mail with another person: theirs alone (see getInjectableFacts). */
+export function isContactFact(f: { source: string }): boolean {
+  return f.source.startsWith('contact:');
+}
+
 export interface Fact {
   id: number;
   text: string;
@@ -1853,7 +1863,13 @@ export class RecallStore {
   };
 
 
-  getInjectableFacts = (): Fact[] => {
+  /**
+   * `contact`: the other person of a mail conversation this turn belongs to.
+   * Facts learned from mail with someone (source `contact:<address>`) are
+   * theirs alone: injectable only in turns with that same person, never
+   * anywhere else — so an outsider can't plant facts that surface elsewhere.
+   */
+  getInjectableFacts = (contact: string | null = null): Fact[] => {
     this.sweepExpiredFacts();
     const rows = this.open()
       .prepare(
@@ -1862,11 +1878,12 @@ export class RecallStore {
         `SELECT ${FACT_SELECT} FROM facts
          WHERE status = 'active' AND (valid_until IS NULL OR valid_until >= ?)
            AND (pinned = 1 OR confidence >= 0.7 OR source IN ('explicit', 'legacy'))
+           AND (source NOT LIKE 'contact:%' OR source = ?)
          ORDER BY id ASC`
       )
-      .all(this.nowSeconds()) as Array<Record<string, unknown>>;
+      .all(this.nowSeconds(), contactSource(contact)) as Array<Record<string, unknown>>;
     const base = rows.map(this.mapFact);
-    const disputed = this.getDisputedRepresentatives();
+    const disputed = this.getDisputedRepresentatives().filter((f) => !isContactFact(f) || f.source === contactSource(contact));
     return disputed.length === 0 ? base : [...base, ...disputed].sort((a, b) => a.id - b.id);
   };
 

@@ -3,6 +3,7 @@ import type { ChatBackend, MailBridgeContext, MailBridgeResult, ParkRequest, Spa
 import { isExternalAddress } from '../../shared/types';
 import type {
   GeneratedImageRef,
+  MessageAttachment,
   BackendEventEnvelope,
   MailApproval,
   MailComposeInput,
@@ -12,7 +13,8 @@ import type {
   Persona,
   TurnAttachment
 } from '../../shared/types';
-import { attachmentPreviews } from '../pi/attachments';
+import { attachmentPreviews, storeMailFiles } from '../pi/attachments';
+import { mailFilePath } from '../interstem/mail-files';
 import * as activity from '../activity';
 import { degrade } from '../degrade';
 import { noteTurnStart } from '../live-turns';
@@ -41,6 +43,7 @@ import {
   createConversation,
   exchangeHops,
   readMail,
+  releaseExternalItems,
   setConversationSession,
   setConversationStatus,
   markMailItemsFiled,
@@ -378,8 +381,12 @@ export class MailRouter {
     const body = input.body.trim();
     const attachments = input.attachments?.length ? input.attachments : undefined;
     if (!body && !attachments) throw new Error('Write the mail before sending it.');
+    const outside = input.forwardOf ? await this.outsideMarkOf(input.forwardOf) : undefined;
 
-    const conversation = await createConversation(input.subject ?? '', to, body, { private: input.private === true });
+    const conversation = await createConversation(input.subject ?? '', to, body, {
+      private: input.private === true,
+      ...(outside ? { outside } : {})
+    });
     const result = await appendMailItem({
       conversationId: conversation.id,
       from: 'user',
@@ -392,6 +399,21 @@ export class MailRouter {
     const source = result.items[result.items.length - 1];
     this.enqueueDelivery(conversation.id, to[0], body, 'user', source.at, source.id, attachments);
     return result;
+  }
+
+  /**
+   * The mark a forward of this item carries: mail from or to another person
+   * (or already carrying their mark) makes the new conversation external
+   * context too. Held mail can't be forwarded: the agents may not read it yet.
+   */
+  private async outsideMarkOf(itemId: string): Promise<{ address: string } | undefined> {
+    const { conversations, items } = await readMail();
+    const item = items.find((i) => i.id === itemId);
+    if (!item) return undefined;
+    if (item.external?.held) throw new Error('Let your agents read that mail first: it is still held.');
+    const from = conversations.find((c) => c.id === item.conversationId);
+    const address = from?.external?.address ?? from?.outside?.address;
+    return address ? { address } : undefined;
   }
 
   /** Reply into a conversation: appends the user's item, resumes the driver. */
@@ -411,8 +433,9 @@ export class MailRouter {
     const driver = conversation.participants[0];
     // A code persona's driver just relayed the agent's question and this is
     // the answer: keep it as a standing answer (never in a private
-    // conversation — nothing there is captured).
-    if (!conversation.private) {
+    // conversation — nothing there is captured — nor one carrying another
+    // person's mail).
+    if (!conversation.private && !conversation.outside) {
       const persona = await getPersona(driver);
       if (persona?.harness) {
         await captureStandingAnswer({
@@ -474,14 +497,22 @@ export class MailRouter {
    * Start a conversation with another Stem's owner: the user's first mail goes
    * straight out (the user wrote it, so nothing to approve).
    */
-  async composeExternal(input: { to: string; self: string; subject?: string; body: string }): Promise<MailListResult> {
+  async composeExternal(input: {
+    to: string;
+    self: string;
+    subject?: string;
+    body: string;
+    attachments?: TurnAttachment[];
+  }): Promise<MailListResult> {
     const body = input.body.trim();
-    if (!body) throw new Error('Write the mail before sending it.');
+    if (!body && !input.attachments?.length) throw new Error('Write the mail before sending it.');
+    // Read (and checked against the caps) before the conversation exists.
+    const files = input.attachments?.length ? await storeMailFiles(input.attachments) : undefined;
     const thread = randomBytes(16).toString('hex');
     const conversation = await createConversation(input.subject ?? '', [], body, {
       external: { address: input.to, thread, self: input.self }
     });
-    return this.sendExternal(conversation, body);
+    return this.sendExternal(conversation, body, files);
   }
 
   private async replyExternal(
@@ -489,19 +520,21 @@ export class MailRouter {
     body: string,
     attachments?: TurnAttachment[]
   ): Promise<MailListResult> {
-    if (attachments?.length) throw new Error('Attachments to another Stem are not supported yet.');
+    const files = attachments?.length ? await storeMailFiles(attachments) : undefined;
     // The user wrote their own answer: any persona draft waiting is moot.
     await this.supersedeParks(conversation.id);
-    return this.sendExternal(conversation, body);
+    return this.sendExternal(conversation, body, files);
   }
 
-  private async sendExternal(conversation: MailConversation, body: string): Promise<MailListResult> {
+  /** `files`: already in the mail-file store (storeMailFiles); sealed in at send time. */
+  private async sendExternal(conversation: MailConversation, body: string, files?: MessageAttachment[]): Promise<MailListResult> {
     if (!this.opts.externalSend) throw new Error('Mail to other Stems is not set up on this server.');
     const result = await appendMailItem({
       conversationId: conversation.id,
       from: 'user',
       to: [conversation.external!.address],
       body,
+      ...(files?.length ? { attachments: files } : {}),
       external: { status: 'queued' }
     });
     const item = result.items[result.items.length - 1];
@@ -515,12 +548,32 @@ export class MailRouter {
    * Only mail the user has released reaches it — quoted as untrusted text —
    * and whatever it drafts waits for the user to send.
    */
-  async draftExternal(conversationId: string, personaId: string, instructions: string): Promise<MailListResult> {
-    const { conversations, items } = await readMail();
+  async draftExternal(
+    conversationId: string,
+    personaId: string,
+    instructions: string,
+    opts: { release?: boolean; auto?: { itemId: string } } = {}
+  ): Promise<MailListResult> {
+    let { conversations, items } = await readMail();
     const conversation = conversations.find((c) => c.id === conversationId);
     if (!conversation?.external) throw new Error('That conversation is not with another Stem.');
     const persona = await getPersona(personaId);
     if (!persona) throw new Error(`No such persona: ${personaId}.`);
+    if (conversation.status === 'working') throw new Error('A draft is already being written here.');
+    const held = items.filter((i) => i.conversationId === conversationId && i.external?.held).sort((a, b) => b.at - a.at);
+    if (opts.auto) {
+      // Unattended: only the mail that triggered it, and only when it is the
+      // one mail still held — anything older (a key-change mail, one from
+      // before auto-draft was on) waits for the user to look at it.
+      const only = held.length === 1 && held[0].id === opts.auto.itemId ? held[0] : null;
+      if (!only || only.external?.keyChanged || only.external?.unsupported) {
+        throw new Error('Not drafting automatically: other mail here waits for you.');
+      }
+      ({ conversations, items } = await releaseExternalItems(conversationId, only.id));
+    } else if (opts.release && held.length) {
+      // One click: the user lets their agents read the mail on screen and asks for a draft.
+      ({ conversations, items } = await releaseExternalItems(conversationId, held[0].id));
+    }
     const thread = items.filter((i) => i.conversationId === conversationId).sort((a, b) => a.at - b.at);
     if (thread.some((i) => i.external?.held)) {
       throw new Error('Release the mail from them first: agents only see mail you have released.');
@@ -532,12 +585,21 @@ export class MailRouter {
     // tag-like run in the bodies is defused as well.
     const fence = `outside-mail-${randomBytes(6).toString('hex')}`;
     const defuse = (text: string) => text.replace(/<(\s*\/?\s*(?:outside-mail|mail)\b)/gi, '‹$1');
-    const history = thread
-      .filter((i) => i.from === address || (i.from === 'user' && i.to.includes(address)))
-      .slice(-12)
+    const quoted = thread.filter((i) => i.from === address || (i.from === 'user' && i.to.includes(address))).slice(-12);
+    // Their files (and the user's) ride the draft turn: released with their mail.
+    const files: TurnAttachment[] = quoted
+      .flatMap((i) => i.attachments ?? [])
+      .flatMap((a) => {
+        const path = a.fileId ? mailFilePath(a.fileId) : null;
+        return path ? [{ name: a.name ?? 'file', path, ...(a.mime ? { mime: a.mime } : {}) }] : [];
+      })
+      .slice(-8);
+    const history = quoted
       .map((i) => {
         const who = i.from === address ? address : 'the user';
-        return `<${fence} from="${who}" at="${new Date(i.at).toISOString()}">\n${defuse(i.body)}\n</${fence}>`;
+        const names = (i.attachments ?? []).map((a) => a.name ?? 'file');
+        const attached = names.length ? `\n[attached: ${defuse(names.join(', '))}]` : '';
+        return `<${fence} from="${who}" at="${new Date(i.at).toISOString()}">\n${defuse(i.body)}${attached}\n</${fence}>`;
       })
       .join('\n');
     const brief =
@@ -557,10 +619,10 @@ export class MailRouter {
       conversationId,
       from: 'user',
       to: [personaId],
-      body: instructions.trim() || 'Draft the reply.'
+      body: instructions.trim() || (opts.auto ? 'Draft the reply. (Automatic: you turned this on for them.)' : 'Draft the reply.')
     });
     const source = result.items[result.items.length - 1];
-    this.enqueueDelivery(conversationId, personaId, brief, 'user', source.at, source.id);
+    this.enqueueDelivery(conversationId, personaId, brief, 'user', source.at, source.id, files.length ? files : undefined);
     return result;
   }
 
@@ -595,7 +657,10 @@ export class MailRouter {
   /** The user's answer to a send draft: send it (possibly edited) or drop it. */
   private async resolveSendDraft(itemId: string, decision: 'allow' | 'deny', body?: string): Promise<{ ok: boolean; error?: string }> {
     const text = body?.trim();
-    if (decision === 'allow' && body !== undefined && !text) return { ok: false, error: 'The draft is empty.' };
+    // The text is what the user saw and approved; a client that sends none
+    // (an older phone showing the draft as a command) must not send it blind.
+    if (decision === 'allow' && body === undefined) return { ok: false, error: 'Update Stem on this device to send drafts from it.' };
+    if (decision === 'allow' && !text) return { ok: false, error: 'The draft is empty.' };
     const settled = await settleSendDraft(itemId, decision === 'allow' ? 'allowed' : 'denied', text);
     if (!settled) return { ok: false, error: 'That draft was already answered.' };
     if (decision === 'deny') {
@@ -605,7 +670,7 @@ export class MailRouter {
     const { conversations } = await readMail();
     const conversation = conversations.find((c) => c.id === settled.item.conversationId);
     if (!conversation?.external) return { ok: false, error: 'That mail conversation no longer exists.' };
-    await this.sendExternal(conversation, text ?? settled.approval.command);
+    await this.sendExternal(conversation, text!);
     return { ok: true };
   }
 
@@ -2070,7 +2135,10 @@ export class MailRouter {
             ...(models.length ? { models } : {}),
             ...(selfAgent ? { agent: selfAgent } : {}),
             ...(source ? { source } : {}),
-            ...(conversation.external ? { external: { address: conversation.external.address } } : {})
+            // Mail with another person, or mail from them forwarded in: external context.
+            ...(conversation.external || conversation.outside
+              ? { external: { address: (conversation.external ?? conversation.outside)!.address } }
+              : {})
           }
         });
       } catch (error) {
@@ -2170,7 +2238,9 @@ export class MailRouter {
       // lane.
       // A private conversation also leaves the persona's own notes untouched:
       // what it learned here would be a memory of the thread by another name.
-      if (notes && settle.status === 'ok' && !conversation.private) {
+      // So does mail with another person (or forwarded from them): their words
+      // must not become the persona's standing notes.
+      if (notes && settle.status === 'ok' && !conversation.private && !conversation.external && !conversation.outside) {
         void reflectOnDelivery(this.opts.runtime, { personaId, assignment: body, threadId: runThreadId });
       }
     } catch (error) {

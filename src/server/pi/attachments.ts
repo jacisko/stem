@@ -17,6 +17,7 @@ import { basename, extname } from 'node:path';
 import { isUploadHandle, resolveUploadHandle } from '../files/staging';
 import { writeToUniquePath } from '../files/store';
 import { extractPdfText } from '../folder-index/pdf';
+import { MAIL_FILES_MAX_BYTES, MAIL_FILES_MAX_COUNT, putMailFile } from '../interstem/mail-files';
 import { heicToJpeg, isHeicAttachment, isHeicNameOrMime } from './heic';
 import type { MessageAttachment, TurnAttachment } from '../../shared/types';
 
@@ -102,7 +103,7 @@ function looksTextual(att: TurnAttachment, ext: string, bytes: Buffer): boolean 
   return Buffer.from(bytes.toString('utf8'), 'utf8').equals(bytes);
 }
 
-async function bytesOf(att: TurnAttachment): Promise<Buffer | null> {
+export async function bytesOf(att: TurnAttachment): Promise<Buffer | null> {
   if (att.dataBase64) return Buffer.from(att.dataBase64, 'base64');
   if (att.path) {
     // A staging handle that resolves to nothing (expired, or never real) reads
@@ -206,6 +207,44 @@ export async function attachmentPreviews(atts: TurnAttachment[]): Promise<Messag
       return dataUrl ? { ...base, dataUrl } : base;
     })
   );
+}
+
+/**
+ * Files for mail with another person: each attachment's bytes kept in the
+ * mail-file store (interstem/mail-files.ts), shown like any mail attachment
+ * and fetchable by its fileId. Throws on an unreadable file or past the caps,
+ * before anything is sent.
+ */
+export async function storeMailFiles(atts: TurnAttachment[]): Promise<MessageAttachment[]> {
+  if (atts.length > MAIL_FILES_MAX_COUNT) throw new Error(`At most ${MAIL_FILES_MAX_COUNT} files per mail.`);
+  const read: Array<{ att: TurnAttachment; bytes: Buffer }> = [];
+  let total = 0;
+  for (const att of atts) {
+    const bytes = await bytesOf(att);
+    if (!bytes) throw new Error(`Couldn’t read ${att.name}.`);
+    total += bytes.length;
+    read.push({ att, bytes });
+  }
+  if (total > MAIL_FILES_MAX_BYTES) throw new Error('The files are too large to send: 17 MB in all at most.');
+  const out: MessageAttachment[] = [];
+  for (const { att, bytes } of read) {
+    const mime = att.mime ?? imageMimeFor(att, extname(att.name || att.path || '').toLowerCase()) ?? undefined;
+    const stored = await putMailFile(bytes, att.name, mime);
+    out.push(await mailFilePreview(stored, bytes));
+  }
+  return out;
+}
+
+/** How a stored mail file shows on its item: a picture with its thumbnail, else a named chip. */
+export async function mailFilePreview(
+  file: { id: string; name: string; mime: string; size: number },
+  bytes: Buffer
+): Promise<MessageAttachment> {
+  const image = file.mime.startsWith('image/') || isHeicNameOrMime({ name: file.name, mime: file.mime });
+  const base: MessageAttachment = { kind: image ? 'image' : 'file', name: file.name, mime: file.mime, fileId: file.id, size: file.size };
+  if (!image || bytes.length > MAX_PREVIEW_BYTES) return base;
+  const dataUrl = await imagePreviewFromBytes(bytes.toString('base64'), file.mime, file.name);
+  return dataUrl ? { ...base, dataUrl } : base;
 }
 
 /**

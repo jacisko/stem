@@ -42,6 +42,8 @@ struct Draft: Codable, Equatable {
     var isPrivate = false
     var to: [String] = []
     var subject = ""
+    /// New mail to a person on their Stem: their email address (nil = to personas).
+    var outTo: String?
 
     var isEmpty: Bool {
         text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && subject.isEmpty

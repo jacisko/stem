@@ -416,6 +416,11 @@ export function embedModelsDir(): string {
  * encryption keys (encrypted at rest when a key wrapper exists), its verified
  * addresses, contacts with their pinned keys, and the outbound queue.
  */
+/** Files sent and received in mail with other people (interstem/mail-files.ts). Never a folder agents read. */
+export function mailFilesRoot(): string {
+  return process.env.STEM_MAIL_FILES_DIR ?? join(userDataRoot(), 'mail-files');
+}
+
 export function interStemStorePath(): string {
   return process.env.STEM_INTERSTEM_STORE ?? join(userDataRoot(), 'interstem.json');
 }

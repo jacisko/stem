@@ -527,11 +527,17 @@ const api: StemApi = {
     body !== undefined
       ? ipcRenderer.invoke('mail:resolveApproval', itemId, decision, body)
       : ipcRenderer.invoke('mail:resolveApproval', itemId, decision),
-  composeExternalMail: (input: { to: string; subject?: string; body: string; self?: string }) =>
+  composeExternalMail: (input: { to: string; subject?: string; body: string; self?: string; attachments?: TurnAttachment[] }) =>
     ipcRenderer.invoke('mail:composeExternal', input),
   releaseMail: (conversationId: string, itemId: string) => ipcRenderer.invoke('mail:release', conversationId, itemId),
-  draftExternalMail: (conversationId: string, personaId: string, instructions?: string) =>
-    ipcRenderer.invoke('mail:draftExternal', conversationId, personaId, instructions ?? ''),
+  draftExternalMail: (conversationId: string, personaId: string, instructions?: string, release?: boolean) =>
+    ipcRenderer.invoke('mail:draftExternal', conversationId, personaId, instructions ?? '', release === true),
+  resendExternalMail: (conversationId: string, itemId: string) => ipcRenderer.invoke('mail:resendExternal', conversationId, itemId),
+  interStemLookup: (address: string) => ipcRenderer.invoke('interstem:lookup', address),
+  interStemContactMemory: (address: string) => ipcRenderer.invoke('interstem:contactMemory', address),
+  interStemForgetContact: (address: string) => ipcRenderer.invoke('interstem:forgetContact', address),
+  interStemSetContact: (address: string, patch: { name?: string | null; autoDraft?: boolean }) =>
+    ipcRenderer.invoke('interstem:setContact', address, patch),
   interStemStatus: () => ipcRenderer.invoke('interstem:status'),
   interStemAddAddress: (address: string) => ipcRenderer.invoke('interstem:addAddress', address),
   interStemVerifyAddress: (address: string, code: string) => ipcRenderer.invoke('interstem:verifyAddress', address, code),
@@ -545,6 +551,16 @@ const api: StemApi = {
     const handler = () => listener();
     ipcRenderer.on('interstem:changed', handler);
     return () => ipcRenderer.removeListener('interstem:changed', handler);
+  },
+  onOpenMailConversation: (listener: (conversationId: string) => void) => {
+    const handler = (_e: unknown, p: { conversationId: string }) => listener(p.conversationId);
+    ipcRenderer.on('mail:openConversation', handler);
+    return () => ipcRenderer.removeListener('mail:openConversation', handler);
+  },
+  onInterStemMail: (listener: (mail: { conversationId: string; from: string; name?: string; subject?: string }) => void) => {
+    const handler = (_e: unknown, mail: { conversationId: string; from: string; name?: string; subject?: string }) => listener(mail);
+    ipcRenderer.on('interstem:mail', handler);
+    return () => ipcRenderer.removeListener('interstem:mail', handler);
   },
   setMailRead: (conversationIds: string[], read: boolean) =>
     ipcRenderer.invoke('mail:setRead', conversationIds, read),
