@@ -207,14 +207,15 @@ async function status() {
 
 // ---- Ask about this window ----------------------------------------------
 
-async function peekWindow(id) {
+async function peekWindow(id, windowId) {
   const ext = await shell.extensionState();
   if (ext.state !== 'ready') {
     emit({ id, ok: true, window: null, access: ACCESS_NONE, linux: ext });
     return;
   }
   const listed = (await listWindows()).filter((w) => !w.minimized && !w.otherWorkspace);
-  const w = listed.find((x) => x.focused) ?? listed[0];
+  // A windowId re-captures a window asked about before (the panel's New).
+  const w = windowId !== undefined ? listed.find((x) => x.id === windowId) : (listed.find((x) => x.focused) ?? listed[0]);
   if (!w) {
     emit({ id, ok: true, window: null, access: ACCESS_ALL });
     return;
@@ -386,7 +387,7 @@ async function handle(obj) {
       return;
     }
     case 'peek-window':
-      await peekWindow(id);
+      await peekWindow(id, obj.windowId);
       return;
     case 'peek-text': {
       const w = (await listWindows()).find((x) => x.id === obj.windowId);

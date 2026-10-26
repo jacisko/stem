@@ -338,7 +338,9 @@ while let line = readLine(strippingNewline: true) {
     case "peek-window":
       // "Ask about this window" (WindowPeek.swift): which window, and one picture of it.
       let access = Status.check()
-      guard let w = WindowPeek.frontWindow() else {
+      // A windowId re-captures a window asked about before (the panel's New); nil once it is gone.
+      let asked = number(obj["windowId"]).map { CGWindowID(Int($0)) }
+      guard let w = asked.map({ WindowPeek.window(id: $0) }) ?? WindowPeek.frontWindow() else {
         emit(["id": id, "ok": true, "window": NSNull(), "access": access])
         break
       }

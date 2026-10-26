@@ -611,12 +611,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         return;
       }
       const w = peeked.window;
-      if (deps.peekBrowser && isBrowserApp(w.app, w.bundleId)) {
-        // quiet: a browser that cannot answer is one without browser control.
-        const seen = await deps.peekBrowser(w.app, w.title).catch(() => ({ ready: false, page: null }));
-        w.browserReady = seen.ready;
-        if (seen.page) w.url = seen.page.url;
-      }
+      await addBrowserState(w);
       const known = windowPanels.get(w.windowId);
       if (known && onScreen(known)) {
         // Already open beside it: just put the keyboard back in it.
@@ -640,6 +635,32 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     } finally {
       peeking = false;
     }
+  }
+
+  /** A browser window: whether browser control can drive it, and its page. */
+  async function addBrowserState(w: QuickChatWindow): Promise<void> {
+    if (!deps.peekBrowser || !isBrowserApp(w.app, w.bundleId)) return;
+    // quiet: a browser that cannot answer is one without browser control.
+    const seen = await deps.peekBrowser(w.app, w.title).catch(() => ({ ready: false, page: null }));
+    w.browserReady = seen.ready;
+    if (seen.page) w.url = seen.page.url;
+  }
+
+  /**
+   * The panel's New: a fresh question about the window it is docked beside
+   * gets a fresh picture and text of it, not the ones from the last summon.
+   * Null when the panel is not a window panel, or the window has closed.
+   */
+  async function repeekPanelWindow(panel: Panel): Promise<QuickChatWindow | null> {
+    const anchored = panel.peek;
+    if (!anchored) return null;
+    const peeked = await peekFrontWindow(anchored.window.windowId);
+    if (!peeked) return null;
+    const w = peeked.window;
+    await addBrowserState(w);
+    const text = w.missing.includes('accessibility') ? Promise.resolve(null) : readWindowText(w.windowId);
+    panel.peek = { window: w, bounds: peeked.bounds, text };
+    return w;
   }
 
   /** What the model is told about the window a prompt was sent with. */
@@ -1056,15 +1077,17 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
       handleLocalFrom('quickchat:run', (sender, prompt: QuickChatPrompt) => runQuickChat(panelFor(sender), prompt));
 
       // Forget the calling panel's thread so its next prompt opens a fresh one.
-      handleLocalFrom('quickchat:newThread', (sender) => {
+      // A window panel also re-captures its window: the reply is the fresh chip.
+      handleLocalFrom('quickchat:newThread', async (sender) => {
         const panel = panelFor(sender);
         panel.overlay.prepareManualReset();
         if (hudShows(panel)) hideHud();
         if (panel.overlay.turnRunning) {
-          return panel.resetBarrier.wait();
+          await panel.resetBarrier.wait();
         } else {
           finishOverlayReset(panel);
         }
+        return repeekPanelWindow(panel);
       });
 
       // Hand the conversation off to the main window: route future events there,

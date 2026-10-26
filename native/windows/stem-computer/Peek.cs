@@ -25,10 +25,13 @@ namespace StemComputer
             return hit ?? listed.FirstOrDefault();
         }
 
-        public static void FrontWindow(object id)
+        /// `windowId` re-captures a window asked about before (the panel's New).
+        public static void FrontWindow(object id, long? windowId)
         {
             var access = new Dictionary<string, object> { { "screen", true }, { "accessibility", true }, { "inputMonitoring", true } };
-            var w = Front();
+            var w = windowId.HasValue
+                ? Windows.List().FirstOrDefault(x => x.Id == windowId.Value && !x.Minimized)
+                : Front();
             if (w == null)
             {
                 Program.Emit(new Dictionary<string, object> { { "id", id }, { "ok", true }, { "window", null }, { "access", access } });
