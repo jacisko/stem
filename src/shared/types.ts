@@ -908,9 +908,9 @@ export interface ConnectedFolder {
   learnModel?: string;
   /**
    * What the person said the folder is when connecting it (the wizard's kinds).
-   * A label only — it picks the folder's icon and changes no behaviour; the
-   * settings it suggested are stored in their own fields. Absent on folders
-   * connected before it existed.
+   * A label only — it picks the folder's icon and changes no behaviour (the
+   * one exception is 'claude'); the settings it suggested are stored in their
+   * own fields. Absent on folders connected before it existed.
    */
   kind?: ConnectedFolderKind;
   /**
@@ -942,7 +942,13 @@ export interface ConnectedFolder {
   skippedCount?: number;
 }
 
-export type ConnectedFolderKind = 'notes' | 'code' | 'docs' | 'private';
+/**
+ * 'claude' is the "Claude Code" folder (memory + session transcripts from one
+ * machine, converted there). Unlike the others it is set by the connect flow,
+ * never picked for an ordinary folder, and it does change behaviour: memory
+ * files are learned even in 'use' mode (folder-index/learn.ts).
+ */
+export type ConnectedFolderKind = 'notes' | 'code' | 'docs' | 'private' | 'claude';
 
 /**
  * A cheap look inside a folder, for the model that suggests its settings: what
@@ -5082,6 +5088,12 @@ export interface StemApi {
    * (remote installs only; the picker already ran). Returns the fresh list.
    */
   addClientFolders(paths: string[]): Promise<ConnectedFolder[]>;
+  /**
+   * The "Claude Code" folder: fill this machine's converted copy of its Claude
+   * Code memory and sessions (desktop/claude-export) and answer the path to
+   * connect and its default name.
+   */
+  prepareClaudeCodeFolder(): Promise<{ path: string; label: string }>;
   /** This machine's per-folder sync phase (see desktop/mirror-host). */
   mirrorLocalState(): Promise<{ folderId: string; clientPath: string; phase: 'idle' | 'syncing' | 'frozen'; lastError?: string }[]>;
   /** The files the owning device's last scan could not mirror, with the reason each. */

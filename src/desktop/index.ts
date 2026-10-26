@@ -33,6 +33,8 @@ import { createBrowserHost, type BrowserHost } from './browser-host';
 import { downloadFile, uploadFile } from './file-transfer';
 import { BROWSER_EXTENSION_DIR, BROWSER_NATIVE_HOST_SCRIPT } from './renderer-assets';
 import { createMirrorHost, type MirrorHost } from './mirror-host';
+import { readMirroredFolders } from './mirror-host/store';
+import { createClaudeExportHost, type ClaudeExportHost } from './claude-export';
 import { createOAuthCourier, type OAuthCourier } from './oauth-courier';
 import { enableGlobalShortcutPortal, isLinux, isMac, mainWindowChromeOptions, requestAttention, timeLocaleArguments } from './platform';
 import { createPresenceHeartbeat, type PresenceHeartbeat } from './presence';
@@ -45,7 +47,7 @@ import { createQuickChat } from './quickchat';
 import { loadRenderer, PRELOAD_SCRIPT } from './renderer-assets';
 import { initTray } from './tray';
 import { RendererPushQueue } from './ui-lifecycle';
-import type { AppSettings, MenuCommand, ThemeState } from '../shared/types';
+import type { AppSettings, ConnectedFolder, MenuCommand, ThemeState } from '../shared/types';
 
 // The Electron main process: windows, tray, the global shortcut, and app
 // lifecycle. It owns nothing about chats, memory, skills or settings — it starts
@@ -425,6 +427,7 @@ let computerHost: ComputerHost | null = null;
 let recorder: Recorder | null = null;
 let browserHost: BrowserHost | null = null;
 let mirrorHost: MirrorHost | null = null;
+let claudeExport: ClaudeExportHost | null = null;
 
 /**
  * Whether the server is answering, as last reported by the proxy. Kept here
@@ -546,6 +549,16 @@ app.whenReady().then(async () => {
         creds: () => endpoint
       });
 
+  // The "Claude Code" folder's converted copy (see desktop/claude-export/): it
+  // runs while that copy is connected — mirrored from here against a remote
+  // server, or connected directly when the server is this process.
+  claudeExport = createClaudeExportHost({
+    isConnected: async (outDir) =>
+      server
+        ? ((await proxy!.invoke('cfolders:list', [])) as ConnectedFolder[]).some((f) => f.path === outDir)
+        : (await readMirroredFolders()).some((f) => f.clientPath === outDir)
+  });
+
   execHost = createExecHost({
     invoke: (channel, args) => proxy!.invoke(channel, args),
     // A device command may have written into a mirrored folder; push it now so
@@ -657,6 +670,7 @@ app.whenReady().then(async () => {
       // And reconcile + rescan the mirrored folders: edits made while the
       // stream was down are exactly what a reconnect has to catch up on.
       if (reachable) void mirrorHost?.refresh();
+      if (reachable) void claudeExport?.refresh();
       // And write up a recording a quit or crash left behind on this Mac.
       if (reachable) void recorder?.recover();
     }
@@ -692,6 +706,7 @@ app.whenReady().then(async () => {
     browserHost,
     recorder,
     mirrorHost,
+    claudeExport: claudeExport!,
     themeChanged
   });
   // A theme file saved, added or removed in the themes folder is the same event
@@ -759,6 +774,7 @@ app.whenReady().then(async () => {
     void computerHost?.start();
     void browserHost?.start();
     void mirrorHost?.start();
+    void claudeExport?.refresh();
   });
 
   quickChat.start(settings.quickChat);
@@ -824,6 +840,7 @@ app.on('before-quit', (event) => {
   browserHost?.close();
   // And a recording in progress: its helper is a child too; its folder stays for recover().
   recorder?.close();
+  claudeExport?.close();
   // And the "Ask about this window" helper.
   quickChat.stop();
   // Nothing to drain when the server is somebody else's process.

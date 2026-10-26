@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Code2, FileText, FolderPlus, FolderSearch, Laptop, Lock, NotebookPen, Server, Sparkles } from 'lucide-react';
+import { Bot, Code2, FileText, FolderPlus, FolderSearch, Laptop, Lock, NotebookPen, Server, Sparkles } from 'lucide-react';
 import type { ConnectedFolder, ConnectedFolderKind, ConnectedFolderPatch, FolderSuggestion } from '../../shared/types';
 import { ServerFolderPicker } from './ServerFolderPicker';
 import { plainLine } from '../../shared/plain-text';
@@ -72,6 +72,27 @@ export const KINDS: Kind[] = [
   }
 ];
 
+/**
+ * The "Claude Code" folder: this computer's Claude Code memory and sessions,
+ * converted here (desktop/claude-export) and connected without a path to
+ * pick. Not in KINDS — it is a source, not a label any folder can wear.
+ */
+export const CLAUDE_KIND: Kind = {
+  value: 'claude',
+  label: 'Claude Code',
+  noun: 'Claude Code',
+  icon: <Bot size={13} />,
+  body: 'Memory and session transcripts from Claude Code on this computer, and Cowork in the Claude app. No path needed. Only the messages are kept; tool output stays here.',
+  notePlaceholder: 'e.g. “My Claude Code history on the work laptop”',
+  settings: { writable: false, memorize: true, index: true, learnMode: 'use' }
+};
+
+const CLAUDE_NOTE =
+  'Claude Code memory and session transcripts from this computer, converted to Markdown: memory/<type>/<project>/ holds its memory notes, sessions/<project>/ and cowork/ one file per session ("## You" is the user).';
+
+/** The desktop app can produce the Claude Code folder; a browser or phone cannot. */
+export const claudeCodeAvailable = (): boolean => typeof window.stem?.prepareClaudeCodeFolder === 'function';
+
 const STEPS = ['Folder', 'Access', 'Memory'] as const;
 
 const LEARN_CHOICES: { value: LearnMode; label: string; hint: string }[] = [
@@ -111,11 +132,11 @@ export function ConnectFolderWizard({
   onDone: (folders: ConnectedFolder[], id: string) => void;
   onCancel: () => void;
 }) {
-  const preset = KINDS.find((k) => k.value === initialKind) ?? null;
+  const preset = (initialKind === 'claude' ? CLAUDE_KIND : KINDS.find((k) => k.value === initialKind)) ?? null;
   const [step, setStep] = useState(0);
   const [place, setPlace] = useState<Place>(remote ? 'client' : 'server');
   const [path, setPath] = useState('');
-  const [label, setLabel] = useState('');
+  const [label, setLabel] = useState(preset?.value === 'claude' ? CLAUDE_KIND.label : '');
   const [note, setNote] = useState('');
   const [writable, setWritable] = useState(preset?.settings.writable ?? false);
   const [memorize, setMemorize] = useState(preset?.settings.memorize ?? true);
@@ -154,6 +175,9 @@ export function ConnectFolderWizard({
 
   const pickKind = (k: Kind) => {
     setAdvice(null);
+    // Into or out of the Claude Code folder, the name follows unless it was typed.
+    if (k.value === 'claude' && (!label || label === baseName(path))) setLabel(CLAUDE_KIND.label);
+    if (k.value !== 'claude' && kind?.value === 'claude' && label === CLAUDE_KIND.label) setLabel(baseName(path));
     setKind(k);
     setWritable(k.settings.writable);
     setMemorize(k.settings.memorize);
@@ -167,11 +191,18 @@ export function ConnectFolderWizard({
     kind && <p className="muted folder-dialog-hint wizard-suggested">Suggested for {kind.noun}. Change anything.</p>
   );
 
+  const claude = kind?.value === 'claude';
   const name = label.trim();
   const absolute = /^([/\\~]|[A-Za-z]:[/\\])/.test(path.trim());
   const duplicatePath = existing.some((f) => (place === 'client' ? f.origin?.clientPath : f.path) === path);
   const nameTaken = existing.some((f) => f.label.toLowerCase() === name.toLowerCase());
-  const folderProblem = !path.trim()
+  const folderProblem = claude
+    ? !name
+      ? 'Give the folder a name.'
+      : nameTaken
+        ? `A connected folder is already called “${name}”.`
+        : null
+    : !path.trim()
     ? null
     : !absolute
       ? 'Use the folder’s full path, starting with /.'
@@ -182,7 +213,7 @@ export function ConnectFolderWizard({
         : nameTaken
           ? `A connected folder is already called “${name}”.`
           : null;
-  const canNext = step === 0 ? !!path.trim() && !folderProblem : true;
+  const canNext = step === 0 ? (claude || !!path.trim()) && !folderProblem : true;
 
   const suggest = async () => {
     setSuggesting(true);
@@ -213,18 +244,27 @@ export function ConnectFolderWizard({
     setError(null);
     try {
       const before = new Set(existing.map((f) => f.id));
-      const target = path.trim();
+      // The Claude Code folder is this computer's converted copy: filled here
+      // first, then connected like any folder on this computer (mirrored up to
+      // a remote server, connected directly when the server runs here).
+      const prepared = claude ? await window.stem.prepareClaudeCodeFolder() : null;
+      const target = prepared?.path ?? path.trim();
       const added =
-        place === 'client' ? await window.stem.addClientFolders([target]) : await window.stem.addConnectedFolders([target]);
+        (prepared ? remote : place === 'client')
+          ? await window.stem.addClientFolders([target])
+          : await window.stem.addConnectedFolders([target]);
       const fresh = added.find((f) => !before.has(f.id));
       if (!fresh) throw new Error('This folder is already connected.');
+      // An untouched default name becomes this computer's, so two machines' copies tell apart.
+      const finalName = prepared && name === CLAUDE_KIND.label ? prepared.label : name;
+      const finalNote = note.trim() || (prepared ? CLAUDE_NOTE : '');
       const patch: ConnectedFolderPatch = {
-        mode: writable ? 'readwrite' : 'read',
+        mode: writable && !claude ? 'readwrite' : 'read',
         memorize,
         index,
         ...(index && memorize ? { learnMode } : {}),
-        ...(name !== fresh.label ? { label: name } : {}),
-        ...(note.trim() ? { note: note.trim() } : {}),
+        ...(finalName !== fresh.label ? { label: finalName } : {}),
+        ...(finalNote ? { note: finalNote } : {}),
         ...(kind ? { kind: kind.value } : {})
       };
       onDone(await window.stem.updateConnectedFolder(fresh.id, patch), fresh.id);
@@ -234,11 +274,13 @@ export function ConnectFolderWizard({
     }
   };
 
+  // The Claude Code folder is always read-only (it is a copy Stem rewrites), so it skips Access.
   const next = () => {
     if (!canNext) return;
-    if (step < STEPS.length - 1) setStep(step + 1);
+    if (step < STEPS.length - 1) setStep(claude && step === 0 ? 2 : step + 1);
     else void connect();
   };
+  const back = () => setStep(claude && step === 2 ? 0 : step - 1);
 
   if (serverPicker) {
     return (
@@ -294,7 +336,14 @@ export function ConnectFolderWizard({
 
         {step === 0 && (
           <>
-            {remote && (
+            {claude && (
+              <p className="muted folder-dialog-hint">
+                Stem keeps a readable copy of Claude Code’s memory and sessions from this computer, and keeps it up to
+                date. Sessions Claude Code later deletes stay in the copy. Sessions Stem’s own coding personas ran are
+                left out, because those chats are already in Stem.
+              </p>
+            )}
+            {remote && !claude && (
               <div className="cfolder-add-choice">
                 <span className="muted">Where does the folder live?</span>
                 {option(
@@ -319,33 +368,35 @@ export function ConnectFolderWizard({
                 )}
               </div>
             )}
-            <div className="folder-dialog-field">
-              <span>Folder</span>
-              <div className="wizard-path">
-                <input
-                  className="skill-approval-input"
-                  aria-label="Folder path"
-                  placeholder="Choose a folder, or paste its path"
-                  spellCheck={false}
-                  value={path}
-                  onChange={(e) => {
-                    const typed = e.target.value;
-                    // Typing a path names the folder too, until the name is edited by hand.
-                    if (!label || label === baseName(path)) setLabel(baseName(typed));
-                    setPath(typed);
-                    setAdvice(null);
-                    setError(null);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') next();
-                  }}
-                />
-                <button type="button" className="icon-action sm" onClick={() => void browse()} title="Choose a folder" aria-label="Choose a folder">
-                  <FolderSearch size={14} />
-                </button>
+            {!claude && (
+              <div className="folder-dialog-field">
+                <span>Folder</span>
+                <div className="wizard-path">
+                  <input
+                    className="skill-approval-input"
+                    aria-label="Folder path"
+                    placeholder="Choose a folder, or paste its path"
+                    spellCheck={false}
+                    value={path}
+                    onChange={(e) => {
+                      const typed = e.target.value;
+                      // Typing a path names the folder too, until the name is edited by hand.
+                      if (!label || label === baseName(path)) setLabel(baseName(typed));
+                      setPath(typed);
+                      setAdvice(null);
+                      setError(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') next();
+                    }}
+                  />
+                  <button type="button" className="icon-action sm" onClick={() => void browse()} title="Choose a folder" aria-label="Choose a folder">
+                    <FolderSearch size={14} />
+                  </button>
+                </div>
               </div>
-            </div>
-            {absolute && (
+            )}
+            {(absolute || claude) && (
               <>
                 <label className="folder-dialog-field">
                   <span>Name</span>
@@ -382,7 +433,7 @@ export function ConnectFolderWizard({
                 <button
                   type="button"
                   className="link-btn wizard-suggest"
-                  disabled={!absolute || !!folderProblem || suggesting || busy}
+                  disabled={claude || !absolute || !!folderProblem || suggesting || busy}
                   onClick={() => void suggest()}
                   title="Stem looks at the folder’s file names and README and fills in every step"
                 >
@@ -392,7 +443,7 @@ export function ConnectFolderWizard({
               </span>
               {advice?.reason && <p className="muted folder-dialog-hint wizard-advice">{plainLine(advice.reason)}</p>}
               <div className="wizard-kinds">
-                {KINDS.map((k) => (
+                {(claudeCodeAvailable() ? [CLAUDE_KIND, ...KINDS] : KINDS).map((k) => (
                   <span key={k.value}>{option(kind?.value === k.value, () => pickKind(k), k.label, k.body, k.icon)}</span>
                 ))}
               </div>
@@ -463,7 +514,9 @@ export function ConnectFolderWizard({
                   ))}
                 </select>
                 <span className="muted">
-                  {LEARN_CHOICES.find((c) => c.value === learnMode)?.hint}
+                  {claude && learnMode === 'use'
+                    ? 'Sessions teach Stem only when they come up in your chats. Claude Code’s memory notes are read as they are added or changed, about one model call per 20 notes.'
+                    : LEARN_CHOICES.find((c) => c.value === learnMode)?.hint}
                 </span>
               </label>
             )}
@@ -472,7 +525,7 @@ export function ConnectFolderWizard({
 
         {error && <p className="error folder-dialog-hint">{error}</p>}
         <div className="mcp-approval-actions">
-          <button type="button" className="push" disabled={busy} onClick={step === 0 ? onCancel : () => setStep(step - 1)}>
+          <button type="button" className="push" disabled={busy} onClick={step === 0 ? onCancel : back}>
             {step === 0 ? 'Cancel' : 'Back'}
           </button>
           <button type="button" className="push default" disabled={!canNext || busy || suggesting} onClick={next}>

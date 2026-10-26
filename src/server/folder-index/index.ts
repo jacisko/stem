@@ -15,7 +15,7 @@ import { log } from '../log';
 import * as activity from '../activity';
 import { summarizeFactTexts } from '../recall/audit';
 import { embedMissingDocVectors } from './embed';
-import { learnFolderBatch } from './learn';
+import { learnFolderBatch, learnScope } from './learn';
 import { scanFolder } from './scan';
 import { FolderIndexStore } from './store';
 import { replaceFile } from '../replace-file';
@@ -293,6 +293,8 @@ export async function learnAllIndexedFolders(opts: {
       const folders = (await indexedFolders()).filter((f) => {
         const mode = effectiveLearnMode(f);
         if (mode === 'all') return true;
+        // The "Claude Code" folder's memory files: learned as they come, no baseline.
+        if (mode === 'use') return learnScope(f, mode) !== null;
         if (mode !== 'new') return false;
         try {
           return storeFor(f.id).hasLearnBaseline();
@@ -301,9 +303,10 @@ export async function learnAllIndexedFolders(opts: {
           return false;
         }
       });
+      const scopeOf = (f: ConnectedFolder): string => learnScope(f, effectiveLearnMode(f)) ?? '';
       const target = folders.find((f) => {
         try {
-          return storeFor(f.id).pendingLearnCount() > 0;
+          return storeFor(f.id).pendingLearnCount(scopeOf(f)) > 0;
         } catch (e) {
           // False takes the folder out of the drain entirely: its backlog is never
           // distilled, and the tab goes on showing the pending count it cannot read.
@@ -317,7 +320,7 @@ export async function learnAllIndexedFolders(opts: {
       }
       // Opened only once there is real work, so an empty drain stays silent.
       handle ??= activity.begin('folders.learn', 'Learning from folders', { stepped: true });
-      const res = await learnFolderBatch(storeFor(target.id), target, opts.makeLlm(target));
+      const res = await learnFolderBatch(storeFor(target.id), target, opts.makeLlm(target), scopeOf(target));
       if (!res || res.processed === 0) {
         closeEntry();
         return false;
@@ -327,7 +330,7 @@ export async function learnAllIndexedFolders(opts: {
       try {
         activity.progress(handle, {
           done: docsLearned,
-          total: docsLearned + storeFor(target.id).pendingLearnCount()
+          total: docsLearned + storeFor(target.id).pendingLearnCount(scopeOf(target))
         });
       } catch {
         // quiet: a closed or locked index costs this iteration's progress bar. The

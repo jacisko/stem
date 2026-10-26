@@ -55,6 +55,32 @@ Rules:
 - Output ONLY {"claims":[...]} where each claim is:
   {"text":"The user ...","category":"identity|preference|relationship|work|project|health|finance|location|schedule|other","sensitivity":"standard|sensitive","validUntil":"YYYY-MM-DD or null","evidenceDocIds":[1],"supersedesFactIds":[],"conflictsWithFactIds":[]}`;
 
+/**
+ * Claude Code memory the user's own assistant wrote about them (`user`) or
+ * from their corrections (`feedback`) is closer to the user's word than a
+ * document is: above a doc fact, still below what they said to Stem (0.9),
+ * and like every doc fact it never silently overrides a conversation fact.
+ */
+export const CLAUDE_USER_MEMORY_CONFIDENCE = 0.8;
+
+const CLAUDE_USER_MEMORY = /^memory\/(user|feedback)\//;
+
+/** Told to the model for the "Claude Code" folder, whose layout is fixed (desktop/claude-export). */
+export const CLAUDE_FOLDER_CONTEXT = `About these documents: they come from the user's Claude Code, their AI coding assistant. Files under memory/<type>/<project>/ are notes that assistant kept: "user" notes describe the user, "feedback" notes record corrections the user gave it, "project" and "reference" notes describe work in progress and where things live. Files under sessions/ and cowork/ are conversation transcripts, where "## You" is the user and "## Claude" is the assistant. Learn facts about the user, their work and their projects (what a project is, who it is for, decisions the user made). Skip build hashes, commit ids, deploy logs, bug histories and anything only the assistant claimed.`;
+
+/**
+ * Which of a folder's docs the learn drain may distill, or null when none: the
+ * whole folder in 'new'/'all' mode (as a '' prefix), and for the "Claude Code"
+ * folder in 'use' mode its memory/ files alone. Those are few, short and
+ * already sorted into facts, so they are worth learning as they come; the
+ * transcripts are not, and wait to come up in a chat like any 'use' doc.
+ */
+export function learnScope(folder: ConnectedFolder, mode: 'off' | 'use' | 'new' | 'all'): string | null {
+  if (mode === 'new' || mode === 'all') return '';
+  if (mode === 'use' && folder.kind === 'claude') return 'memory/';
+  return null;
+}
+
 export interface LearnBatch {
   /** The docs in this batch, in prompt order; [doc:n] keys are index+1. */
   docs: PendingLearnDoc[];
@@ -72,8 +98,8 @@ function docDate(mtimeMs: number): string {
  * arrives later, so a sweep must replay the folder in chronological order.
  * Always includes at least one doc (a single over-cap doc goes alone, truncated).
  */
-export function buildLearnBatch(store: FolderIndexStore, maxChars = MAX_TRANSCRIPT_CHARS): LearnBatch | null {
-  const pending = store.pendingLearnDocs(MAX_BATCH_LEARN_DOCS);
+export function buildLearnBatch(store: FolderIndexStore, maxChars = MAX_TRANSCRIPT_CHARS, under = ''): LearnBatch | null {
+  const pending = store.pendingLearnDocs(MAX_BATCH_LEARN_DOCS, under);
   if (pending.length === 0) return null;
   const docs: PendingLearnDoc[] = [];
   const entries: string[] = [];
@@ -123,9 +149,10 @@ export interface LearnBatchResult {
 export async function learnFolderBatch(
   store: FolderIndexStore,
   folder: ConnectedFolder,
-  llm: LlmClient
+  llm: LlmClient,
+  under = ''
 ): Promise<LearnBatchResult | null> {
-  const batch = buildLearnBatch(store);
+  const batch = buildLearnBatch(store, MAX_TRANSCRIPT_CHARS, under);
   if (!batch) return null;
   const factsGeneration = getFactsGeneration();
   const source = `folder:${folder.id}`;
@@ -142,7 +169,7 @@ export async function learnFolderBatch(
   try {
     const today = new Date().toISOString().slice(0, 10);
     reply = await llm.complete(
-      `${DOC_DISTILL_INSTRUCTIONS}\n\nToday's date: ${today}.${knownBlock}\n\n${batch.block}`
+      `${DOC_DISTILL_INSTRUCTIONS}${folder.kind === 'claude' ? `\n\n${CLAUDE_FOLDER_CONTEXT}` : ''}\n\nToday's date: ${today}.${knownBlock}\n\n${batch.block}`
     );
   } catch (err) {
     // Model/transport failure: leave the batch unstamped; a later pass retries.
@@ -203,7 +230,10 @@ export async function learnFolderBatch(
       source,
       category: claim.category,
       sensitivity: claim.sensitivity,
-      confidence: DOC_FACT_CONFIDENCE,
+      confidence:
+        folder.kind === 'claude' && evidenceDocs.length > 0 && evidenceDocs.every((d) => CLAUDE_USER_MEMORY.test(d.relPath))
+          ? CLAUDE_USER_MEMORY_CONFIDENCE
+          : DOC_FACT_CONFIDENCE,
       validUntil: claim.validUntil,
       evidence: evidenceDocs.map((d) => ({
         messageId: null,

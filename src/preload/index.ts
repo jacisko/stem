@@ -163,6 +163,7 @@ const api: StemApi = {
       : ipcRenderer.invoke('cfolders:suggest', target),
   browseServerFolders: (path?: string) => ipcRenderer.invoke('cfolders:browse', path),
   addClientFolders: (paths: string[]) => ipcRenderer.invoke('mirror:addLocal', paths),
+  prepareClaudeCodeFolder: () => ipcRenderer.invoke('claude:prepareLocal'),
   mirrorLocalState: () => ipcRenderer.invoke('mirror:localState'),
   mirrorSkippedFiles: (id: string) => ipcRenderer.invoke('cfolders:skipped', id),
 
