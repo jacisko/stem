@@ -526,9 +526,14 @@ describe('createBrowserHost', () => {
       await until(() => !!result('r4'));
       expect(result('r4')?.error).toContain('none of those is set up');
       expect(work.received.filter((m) => m.type === 'request')).toEqual([]);
+      // Every profile unticked: refused as the user's choice.
+      host.onRequest({ ...request('r5', { kind: 'snapshot' }, 't5'), allowed: [] });
+      await until(() => !!result('r5'));
+      expect(result('r5')?.error).toContain('allowed this conversation none of the browser profiles');
+      expect(work.received.filter((m) => m.type === 'request')).toEqual([]);
     });
 
-    it('lets the first profile take over an entry from before profiles, and forgets only a closed one', async () => {
+    it('lets the first profile take over an entry from before profiles, and removes a profile, open or closed', async () => {
       writeFileSync(
         process.env.STEM_BROWSER_HOST_FILE!,
         JSON.stringify({ version: 1, enabled: true, chosen: '/Applications/Arc.app', known: [{ id: '/Applications/Arc.app', name: 'Arc', label: 'Work' }] })
@@ -541,14 +546,21 @@ describe('createBrowserHost', () => {
       ]);
       expect(state.chosen).toBe(`/Applications/Arc.app#${WORK}`);
 
-      expect((await host.forget(`/Applications/Arc.app#${HOME}`)).browsers).toHaveLength(2);
-      home.socket.destroy();
-      await home.closed;
-      await until(() => lastAnnounce()?.browsers.filter((b) => b.connected).length === 1);
+      // Still open: the extension is told to remove itself, and the profile goes at once.
       const after = await host.forget(`/Applications/Arc.app#${HOME}`);
+      expect(await home.next('uninstall')).toEqual({ type: 'uninstall' });
+      await home.closed;
       expect(after.browsers.map((b) => b.id)).toEqual([`/Applications/Arc.app#${WORK}`]);
       // An app's only profile goes by the app's name unless the user named it.
       expect(after.browsers[0]!.profile).toBe('Work');
+      await until(() => lastAnnounce()?.browsers.length === 1);
+
+      // An extension too old to remove itself reconnects: refused, not remembered again.
+      const again = await connectPeer(socketPath, arc(), profileHello(HOME));
+      peers.push(again);
+      expect(await again.next('uninstall')).toEqual({ type: 'uninstall' });
+      await again.closed;
+      expect((await host.localState()).browsers.map((b) => b.id)).toEqual([`/Applications/Arc.app#${WORK}`]);
     });
   });
 

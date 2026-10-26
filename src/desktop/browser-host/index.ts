@@ -388,6 +388,12 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
    * extension says hello again, and a second reload would loop forever.
    */
   const reloadOwed = new Set<string>();
+  /**
+   * Profiles the user removed while their extension was connected. It was told
+   * to uninstall itself; one too old to know how would reconnect and be
+   * remembered again, so its hellos are refused until Set up runs again.
+   */
+  const removed = new Set<string>();
 
   const send = (conn: Conn, message: ToExtension): boolean => {
     const frame = encodeFrame(message);
@@ -488,6 +494,11 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
       if (old && old !== conn) old.socket.destroy();
       conn.key = key;
       conns.set(key, conn);
+    }
+    if (removed.has(key)) {
+      send(conn, { type: 'uninstall' });
+      conn.socket.end();
+      return;
     }
     if (reloadOwed.delete(key) || reloadOwed.delete(conn.appPath)) {
       send(conn, { type: 'reload' });
@@ -1037,6 +1048,14 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
       : undefined;
     const scope = scopeOf(full, allowed);
     const settings = scope.settings;
+    if (allowed && allowed.length === 0) {
+      return {
+        ok: false,
+        error:
+          'The user allowed this conversation none of the browser profiles on this Mac. Do not retry; tell the ' +
+          'user, and that they can tick one in the persona’s browser pin or Settings → Features → Browser control.'
+      };
+    }
     // Which profile: the one named in this call, else the one this thread
     // named last, else the default.
     let id: string | undefined;
@@ -1192,7 +1211,14 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
     },
 
     async forget(id) {
-      if (conns.has(id)) return state();
+      const conn = conns.get(id);
+      if (conn) {
+        // Still open in that profile: remove the extension, or it would come straight back.
+        removed.add(id);
+        send(conn, { type: 'uninstall' });
+        conn.socket.end();
+        dropConn(conn);
+      }
       await updateBrowserHostSettings((cur) => {
         const known = cur.known.filter((b) => b.id !== id);
         if (cur.chosen !== id) return { ...cur, known };
@@ -1208,6 +1234,7 @@ export function createBrowserHost(deps: BrowserHostDeps): BrowserHost {
 
     async setUp() {
       if (!supported) return state();
+      removed.clear();
       await listen().catch((e) => log('browser-host', 'could not listen for the extension', { error: String(e) }));
       if (hasSandboxedBrowsers(deps.home, platform)) {
         // Before the relays are written: they carry the port.

@@ -197,6 +197,8 @@ export type ToExtension =
   | { type: 'end'; threadId: string }
   /** The extension's files on disk changed (a Stem update): reload to pick them up. */
   | { type: 'reload' }
+  /** The user removed this profile in Stem's settings: take the extension out of it. Older extensions ignore it. */
+  | { type: 'uninstall' }
   /** "Ask about this window": answer with the page in front (ExtensionResult.page). Older extensions ignore it. */
   | { type: 'peek'; id: string }
   /** What Stem calls this browser profile ("Work", "Arc 2"), for the popup. */

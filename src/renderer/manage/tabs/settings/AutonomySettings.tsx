@@ -1050,8 +1050,10 @@ export function AutonomySections() {
                     onChange={(id) => void window.stem.chooseBrowser(id).then(setBrowserHost)}
                   />
                 </ValueRow>
-                <BrowserProfilesRow state={browserHost} onState={setBrowserHost} />
               </>
+            )}
+            {browserHost.enabled && browserHost.browsers.length > 0 && (
+              <BrowserProfilesRow state={browserHost} onState={setBrowserHost} />
             )}
           </>
         )}
@@ -1068,8 +1070,9 @@ function browserLabel(b: BrowserInfo): string {
 /**
  * The browser profiles that have the extension, each with a name field — what
  * the model passes as `profile`, and what the extension's popup says, which is
- * how the user tells which profile is which — and, once closed, a way to
- * forget one (its extension was removed, or the profile deleted).
+ * how the user tells which profile is which — and a way to remove one: an
+ * open profile's extension uninstalls itself, a closed one is forgotten (its
+ * extension was removed, or the profile deleted).
  */
 function BrowserProfilesRow({
   state,
@@ -1132,16 +1135,25 @@ function BrowserProfileLine({ browser, onState }: { browser: BrowserInfo; onStat
           if (e.key === 'Escape') setDraft(given);
         }}
       />
-      {!browser.connected && (
-        <button
-          className="icon-action sm"
-          title="Forget this profile"
-          aria-label={`Forget this ${browser.name} profile`}
-          onClick={() => void window.stem.forgetBrowser(browser.id).then(onState)}
-        >
-          <Trash2 size={14} />
-        </button>
-      )}
+      <button
+        className="icon-action sm"
+        title={browser.connected ? 'Remove the Stem extension from this profile' : 'Forget this profile'}
+        aria-label={`${browser.connected ? 'Remove the Stem extension from' : 'Forget'} this ${browser.name} profile`}
+        onClick={() => {
+          if (
+            browser.connected &&
+            !window.confirm(
+              `Remove the Stem extension from ${browserLabel(browser)}?\n\nStem can no longer use this profile. ` +
+                'To bring it back, use Set up again and load the extension there.'
+            )
+          ) {
+            return;
+          }
+          void window.stem.forgetBrowser(browser.id).then(onState);
+        }}
+      >
+        <Trash2 size={14} />
+      </button>
       {browser.hint && <em className="browser-profile-hint">{browser.hint}</em>}
       {error && <em className="exec-rule-error">{error}</em>}
     </div>

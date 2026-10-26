@@ -217,6 +217,13 @@ async function onNativeMessage(msg) {
       await endAllRuns();
       chrome.runtime.reload();
       return;
+    case 'uninstall':
+      await endAllRuns();
+      // Needs no "management" permission: an extension may always remove itself.
+      chrome.management.uninstallSelf().catch((e) => {
+        lastError = String((e && e.message) || e);
+      });
+      return;
     case 'host':
       hostConnected = !!msg.connected;
       refreshBadge();

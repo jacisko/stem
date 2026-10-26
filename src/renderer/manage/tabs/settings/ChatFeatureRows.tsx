@@ -327,8 +327,9 @@ export function ChatBrowserRows(props: { devices: DeviceInfo[]; clientDeviceId: 
 
 /**
  * Which browser profiles on a Mac a persona or chats may use: every one
- * (absent — profiles set up later included) or the ones ticked. Shared by the
- * persona editor's browser pin and Settings' chat rows. The Mac enforces it.
+ * (absent — profiles set up later included) or the ones ticked, which may be
+ * none. Shared by the persona editor's browser pin and Settings' chat rows.
+ * The Mac enforces it.
  */
 export function BrowserProfileChecks({
   profiles,
@@ -358,8 +359,6 @@ export function BrowserProfileChecks({
           <input
             type="checkbox"
             checked={ticked(p.id)}
-            // The last one stays: a browser with no profile to use is no browser.
-            disabled={ticked(p.id) && count <= 1}
             onChange={(e) => {
               const current = all ? profiles.map((x) => x.id) : value;
               const rest = current.filter((id) => id !== p.id);
@@ -376,6 +375,7 @@ export function BrowserProfileChecks({
           <span>A profile no longer set up on this Mac</span>
         </label>
       ))}
+      {count === 0 && stale.length === 0 && <em className="scratch-empty">No profile ticked: the browser stays off here.</em>}
     </div>
   );
 }
