@@ -197,6 +197,17 @@ const APPROVAL_REQUESTS = new Set([
   'skills:approvalRequest'
 ]);
 
+/** Answers (or expiries) of those asks: the pill stops waiting on them. */
+const APPROVAL_RESOLUTIONS = new Set([
+  'exec:approvalResolved',
+  'harness:approvalResolved',
+  'mcp:adminApprovalResolved',
+  'instructions:approvalResolved',
+  'skills:approvalResolved'
+]);
+
+const WAITING: QuickChatStatus = { phase: 'waiting', label: 'Waiting for your approval' };
+
 export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   /** Bottom-left status pill shown while a panel is hidden and its turn runs. */
   let hudWindow: BrowserWindow | null = null;
@@ -251,6 +262,45 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   const hud = new HudPill();
   /** The panel the pill speaks for while Quick Chat owns it (its click reveals it). */
   let hudPanel: Panel | null = null;
+  /** Unanswered approval cards, id → asking thread: the pill says so instead of "Working…". */
+  const approvals = new Map<string, string>();
+
+  function awaitingApproval(threadId: string | null | undefined): boolean {
+    if (!threadId) return false;
+    for (const t of approvals.values()) if (t === threadId) return true;
+    return false;
+  }
+
+  function dropApprovals(threadId: string | null | undefined): void {
+    for (const [id, t] of approvals) if (t === threadId) approvals.delete(id);
+  }
+
+  /** A card was raised or answered: re-push the pill that speaks for its thread. */
+  function noteApproval(channel: string, payload: unknown): void {
+    const p = (payload ?? {}) as { id?: unknown; threadId?: unknown };
+    if (p.id === undefined || p.id === null) return;
+    const id = String(p.id);
+    let threadId: string | undefined;
+    if (APPROVAL_REQUESTS.has(channel)) {
+      if (typeof p.threadId !== 'string') return;
+      threadId = p.threadId;
+      approvals.set(id, threadId);
+    } else {
+      threadId = approvals.get(id);
+      if (!approvals.delete(id)) return;
+    }
+    const panel = ownerOf(threadId);
+    if (panel) {
+      if (hudShows(panel) && !onScreen(panel) && hud.lastPhase !== 'finished')
+        showPanelHud(panel, { phase: 'working', label: 'Working…' });
+    } else syncMainHud();
+  }
+
+  /** A panel's pill push, held at "waiting" while its thread has a card open. */
+  function showPanelHud(panel: Panel, status: QuickChatStatus): void {
+    const waiting = status.phase !== 'finished' && awaitingApproval(panel.overlay.threadId);
+    showHud(waiting ? WAITING : status, 'quickchat', panel);
+  }
 
   function panels(): Panel[] {
     return [plain, ...windowPanels.values()];
@@ -399,7 +449,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         // Always update — tool calls and teed web searches mid-answer keep the
         // pill live instead of freezing at 'Answering…' after the first token.
         if (type && type !== 'agentMessage')
-          showHud({ phase: 'working', label: activityLabel(type, item?.name, item?.detail) }, 'quickchat', panel);
+          showPanelHud(panel, { phase: 'working', label: activityLabel(type, item?.name, item?.detail) });
         break;
       }
       case 'item/agentMessage/delta': {
@@ -408,7 +458,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         // (first token, or resuming the answer after a mid-answer tool call).
         if (!overlay.hudTextSeen || hud.lastPhase !== 'answering' || hudPanel !== panel) {
           overlay.noteAnswerText();
-          showHud({ phase: 'answering', label: 'Answering…' }, 'quickchat', panel);
+          showPanelHud(panel, { phase: 'answering', label: 'Answering…' });
         }
         break;
       }
@@ -422,6 +472,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
               ? 'Request failed'
               : 'Stopped';
         overlay.settleTurn(Date.now());
+        dropApprovals(overlay.threadId);
         // A reset must not release the old thread until this terminal event has
         // been routed. Otherwise its trailing deltas can be mistaken for the next
         // Quick Chat session.
@@ -452,9 +503,10 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     if (hud.owner === 'quickchat') return;
     const main = deps.mainWindow();
     const blurred = !!main && !main.isDestroyed() && !main.isFocused();
-    const running = pillTurns.turns.some(t => !ownerOf(t.threadId));
-    if (running && blurred) {
-      showHud({ phase: 'working', label: 'Working…', reveal: 'main' }, 'main');
+    const running = pillTurns.turns.filter(t => !ownerOf(t.threadId));
+    if (running.length && blurred) {
+      const waiting = running.some(t => awaitingApproval(t.threadId));
+      showHud({ ...(waiting ? WAITING : { phase: 'working', label: 'Working…' }), reveal: 'main' }, 'main');
     } else if (hud.owner === 'main') hideHud();
   }
 
@@ -469,6 +521,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     if (method === 'item/started' || method === 'item/agentMessage/delta') {
       syncMainHud();
     } else if (method === 'turn/completed' || method === 'turn/failed' || method === 'turn/aborted' || method === 'process/exit') {
+      dropApprovals(threadId);
       if (hud.owner === 'main' && !pillTurns.turns.some(t => !ownerOf(t.threadId))) {
         const label = method === 'turn/completed' ? 'Answer ready' : method === 'turn/aborted' ? 'Stopped' : 'Request failed';
         showHud({ phase: 'finished', label, reveal: 'main' }, 'main');
@@ -950,7 +1003,11 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     submitHudTurn(input) { pillTurns.submit(input); },
     acceptHudTurn(turnId) { pillTurns.accepted(turnId); },
     abandonHudTurn(turnId) { pillTurns.abandon(turnId); syncMainHud(); },
-    disconnectHud() { pillTurns.disconnect(); hideHud(); },
+    disconnectHud() {
+      pillTurns.disconnect();
+      approvals.clear(); // The reconnect replays every card still open.
+      hideHud();
+    },
     reconcileHud(deviceId, turns) {
       pillTurns.reconcile(deviceId, turns);
       hideHud(); // Snapshot corrections are silent; only live endings chime.
@@ -963,7 +1020,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         }
         if (running && !onScreen(panel)) {
           panel.overlay.beginTurn(Date.now());
-          if (!shown) showHud({ phase: 'working', label: 'Working…' }, 'quickchat', panel);
+          if (!shown) showPanelHud(panel, { phase: 'working', label: 'Working…' });
           shown = true;
         }
       }
@@ -1095,6 +1152,8 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     shortcutStatus: quickChatShortcutStatus,
 
     sendToOverlay(channel, payload) {
+      // Every approval ask and answer funnels through here (live and replayed).
+      if (APPROVAL_REQUESTS.has(channel) || APPROVAL_RESOLUTIONS.has(channel)) noteApproval(channel, payload);
       if (APPROVAL_REQUESTS.has(channel)) {
         // One card, in the panel whose conversation asked — or the plain panel,
         // whose dialog has always carried asks from elsewhere.

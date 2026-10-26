@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Check } from 'lucide-react';
+import { Check, ShieldAlert } from 'lucide-react';
 import type { QuickChatStatus } from '../../shared/types';
 import { formatAccelerator } from '../accel';
 import chimeUrl from '../assets/chime.wav';
@@ -26,6 +26,9 @@ export function StatusHud() {
 
   if (!status) return null;
   const finished = status.phase === 'finished';
+  // Parked on an approval card: nothing moves until the user answers, so it
+  // reads as a call to act (and prompts the click), not as "still working".
+  const waiting = status.phase === 'waiting';
   // The follow-me pill (reveal === 'main') tracks a main-window thread, so it
   // raises the main window and prompts a plain click; the overlay pill prompts
   // the real summon key when one is bound.
@@ -35,12 +38,16 @@ export function StatusHud() {
   return (
     <div className="hud-root">
       <button
-        className={`hud-pill${finished ? ' finished' : ''}`}
+        className={`hud-pill${finished ? ' finished' : ''}${waiting ? ' waiting' : ''}`}
         onClick={() => (toMain ? window.stem.revealMain() : window.stem.revealQuickChat())}
       >
         {finished ? (
           <span className="hud-check" aria-hidden="true">
             <Check size={13} />
+          </span>
+        ) : waiting ? (
+          <span className="hud-wait" aria-hidden="true">
+            <ShieldAlert size={13} />
           </span>
         ) : (
           <span className="activity-dots" aria-hidden="true">
@@ -50,7 +57,7 @@ export function StatusHud() {
           </span>
         )}
         <span className="hud-label">{status.label}</span>
-        {finished && <span className="hud-hint">{hint}</span>}
+        {(finished || waiting) && <span className="hud-hint">{hint}</span>}
       </button>
     </div>
   );

@@ -4681,7 +4681,7 @@ export interface QuickChatPrompt {
 }
 
 /** HUD phases for the bottom-left status pill while the overlay is hidden. */
-export type QuickChatStatusPhase = 'working' | 'answering' | 'finished';
+export type QuickChatStatusPhase = 'working' | 'waiting' | 'answering' | 'finished';
 
 /** Main → HUD: the one-line status to display. */
 export interface QuickChatStatus {

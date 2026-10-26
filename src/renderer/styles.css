@@ -3298,6 +3298,12 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
   color: var(--accent);
 }
 .hud-pill.finished { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.hud-wait {
+  display: inline-flex;
+  flex: none;
+  color: var(--warn);
+}
+.hud-pill.waiting { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
 .hud-hint {
   flex: none;
   margin-left: var(--sp-1);
