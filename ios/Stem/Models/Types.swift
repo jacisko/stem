@@ -198,6 +198,12 @@ struct ServerSettings: Decodable {
     var webSearch: WebSearch
     var defaults: Defaults?
     var customInstructions: Instructions?
+    struct ChatFeatures: Decodable {
+        struct Allow: Decodable { var allow: Bool }
+        var voice: Allow?
+    }
+    /// Absent on an older server, which has no voice chat.
+    var chatFeatures: ChatFeatures?
 }
 
 // MARK: Personas

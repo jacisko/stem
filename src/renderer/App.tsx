@@ -13,6 +13,7 @@ import type {
   ModelSummary,
   ReleaseNotesSnapshot,
   RuntimeStatus,
+  StartTurnResult,
   ScheduledTask,
   TaskNotifyPayload,
   TurnAttachment,
@@ -87,11 +88,15 @@ import { deletePendingIfCurrent, rekeyPendingIfCurrent } from './pendingTurn';
 import { RequestGate } from './requestGate';
 import { dismissTaskAlert, enqueueTaskAlert } from './taskAlerts';
 import { practiceInput } from './chat/recorder-store';
+import { useVoiceCall } from './chat/voice';
+import { waitForTurnReply } from './session/turnReply';
 import { requestManageIntent } from './manage/intents';
 
 // Sentinel key for a brand-new chat that has no backend thread id yet. Its slice is
 // migrated to the real thread id once the first turn returns one.
 const DRAFT = '__draft__';
+/** How long a spoken request waits for the chat to finish its current reply. */
+const VOICE_IDLE_WAIT_MS = 3 * 60_000;
 
 // "This smells like an auth failure" match on a failed turn's error text. Used as
 // the fallback classifier for API-key/local providers, where the getApiKey probe
@@ -455,12 +460,16 @@ export default function App() {
   // Escape-to-retract behavior (Settings → App → Input). Read from persisted settings;
   // re-read on window focus so a change in the Settings tab applies without a restart.
   const [escapeAction, setEscapeAction] = useState<EscapeAction>('off');
+  // Settings → Features → Voice chat; the server refuses a call when it is off,
+  // this only decides whether the composer offers one.
+  const [voiceAllowed, setVoiceAllowed] = useState(false);
   useEffect(() => {
     const load = () => {
       if (window.stem)
         window.stem.getSettings().then((s) => {
           setEscapeAction(s.escapeAction);
           setOnboardingCompleted(s.onboarding.completed);
+          setVoiceAllowed(s.chatFeatures.voice?.allow !== false);
         });
     };
     load();
@@ -468,9 +477,11 @@ export default function App() {
     // Settings tab fires when the user changes the mode, so it applies immediately.
     const onChanged = (e: Event) => setEscapeAction((e as CustomEvent<EscapeAction>).detail);
     window.addEventListener('focus', load);
+    window.addEventListener('stem:chat-features', load);
     window.addEventListener('stem:escape-action', onChanged as EventListener);
     return () => {
       window.removeEventListener('focus', load);
+      window.removeEventListener('stem:chat-features', load);
       window.removeEventListener('stem:escape-action', onChanged as EventListener);
     };
   }, []);
@@ -823,7 +834,12 @@ export default function App() {
   );
 
   const onSend = useCallback(
-    async (text: string, attachments: TurnAttachment[] = []) => {
+    async (
+      text: string,
+      attachments: TurnAttachment[] = [],
+      // The voice call's ask_stem: told the turn's id, then what the start answered.
+      hooks?: { onTurnId?(turnId: string): void; onResult?(result: StartTurnResult): void }
+    ) => {
       // Where this turn's state lives: the open thread, or DRAFT for a new chat.
       const sendKey = activeThreadIdRef.current ?? DRAFT;
       // Capture ownership BEFORE any asynchronous work. A disk-image read must
@@ -841,8 +857,9 @@ export default function App() {
         meta,
         isNewChat: sendKey === DRAFT,
         ...(sendKey === DRAFT ? { draftGeneration: sendSeq, captureDraftMessages: true } : {}),
-        start: (input) =>
-          window.stem.startTurn({
+        start: async (input) => {
+          hooks?.onTurnId?.(input.turnId);
+          const result = await window.stem.startTurn({
             input: input.text,
             turnId: input.turnId,
             threadId: sendKey === DRAFT ? undefined : sendKey,
@@ -856,7 +873,10 @@ export default function App() {
             attachments: input.attachments.length ? input.attachments : undefined,
             // A draft card's "Practice run": this send starts it (recorder-store).
             ...(sendKey !== DRAFT ? practiceInput(sendKey) : {})
-          }),
+          });
+          hooks?.onResult?.(result);
+          return result;
+        },
         onStarted: (result, { pending, alreadySettled, userMsgId }) => {
           if (sendKey === DRAFT && result.threadId) {
             // First turn of a new chat. Adopt the real id only if this draft is
@@ -954,6 +974,61 @@ export default function App() {
     },
     [core, refreshChats, applyServerList, modelId, effort, serviceTier, defaultFormat, setThread, noteChatOpened]
   );
+
+  // Voice chat (chat/voice.tsx). Each spoken request is an ordinary send in the
+  // open chat; the call speaks the reply that turn settles with. A call stays
+  // with the chat it started in — or the chat its first request created — and
+  // ends when the user opens another, so a request never lands somewhere else.
+  // undefined = no call; null = a draft the first request will turn into a chat.
+  const voiceThreadRef = useRef<string | null | undefined>(undefined);
+  const askStem = useCallback(
+    async (request: string): Promise<string> => {
+      // Requests queue (voiceEvents.ts), and the previous reply's settle can
+      // reach this chat's state a frame after its waiter saw it — wait for the
+      // chat to go idle rather than be refused as busy.
+      const key = activeThreadIdRef.current ?? DRAFT;
+      for (let waited = 0; core.store.getThread(key)?.running && waited < VOICE_IDLE_WAIT_MS; waited += 100) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const waiter = waitForTurnReply((listener) => window.stem.onBackendEvent(listener));
+      let started = false;
+      let answered = false;
+      await onSend(request, [], {
+        onTurnId: (turnId) => {
+          started = true;
+          waiter.watch(turnId);
+        },
+        onResult: (result) => {
+          answered = true;
+          if (result.threadId && voiceThreadRef.current !== undefined) voiceThreadRef.current = result.threadId;
+          if (result.threadId) waiter.watchThread(result.threadId);
+          if (result.turnId) waiter.watch(result.turnId);
+          if (result.handled) waiter.answer(result.assistantMessage ?? 'Done.');
+          else if (result.canceled) waiter.fail(new Error('The request was canceled.'));
+        }
+      });
+      // sendTurn refuses while this chat is still answering, and swallows a
+      // failed start into an error bubble; either way no turn will settle.
+      if (!started) waiter.fail(new Error('Stem is still answering something else in this chat. Ask again when it is done.'));
+      else if (!answered) waiter.fail(new Error('Stem could not start that request.'));
+      return waiter.promise;
+    },
+    [onSend, core]
+  );
+  const voice = useVoiceCall(askStem);
+  const voiceLive = voice.phase !== 'idle';
+  const stopVoice = voice.stop;
+  useEffect(() => {
+    if (!voiceLive) {
+      voiceThreadRef.current = undefined;
+      return;
+    }
+    // The call is bound to the chat open when it starts; a draft's first
+    // request rebinds it to the chat it creates (onResult, before the switch).
+    if (voiceThreadRef.current === undefined) voiceThreadRef.current = activeThreadIdRef.current;
+    else if (activeThreadId !== voiceThreadRef.current) stopVoice();
+  }, [voiceLive, activeThreadId, stopVoice]);
+  const voiceOffered = voiceAllowed && !!status?.providers?.includes('openai-codex');
 
   // Quick Chat hand-off → main window: adopt the overlay's conversation as the
   // active chat, seeding its slice from the overlay's in-memory messages (so it's
@@ -1934,6 +2009,7 @@ export default function App() {
           <ChatView
             key={activeKey}
           ref={chatViewRef}
+          voice={voiceOffered ? voice : undefined}
           messages={cur.messages}
           running={cur.running}
           streamingId={cur.streamingId}

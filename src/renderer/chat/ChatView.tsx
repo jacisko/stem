@@ -39,6 +39,7 @@ import type {
 import { formatSystemVersion } from '../../shared/sys-version';
 import { ActivityRows, SourcesList } from './ActivityRows';
 import { GeneratedImages } from './GeneratedImage';
+import type { VoiceCall } from './voice';
 import { Composer, type ComposerHandle } from './Composer';
 import { RecordingDraftCard } from './RecordingDraftCard';
 import { loadDrafts, readDrafts, subscribeRecorder } from './recorder-store';
@@ -108,6 +109,8 @@ export interface ChatViewHandle {
 }
 
 interface ChatViewProps {
+  /** The window's voice call, passed through to the composer. */
+  voice?: VoiceCall;
   messages: ChatMessage[];
   running: boolean;
   streamingId: string | null;
@@ -434,7 +437,8 @@ export const ChatView = forwardRef<ChatViewHandle, ChatViewProps>(function ChatV
   reportDraft = false,
   onDraftChange,
   onNoteSaved,
-  pinboard = false
+  pinboard = false,
+  voice
 }: ChatViewProps, ref) {
   const board = useChatPins(pinboard ? threadId : null);
   // Draft skills this chat's recordings became (recorder-store.ts): loaded on
@@ -1039,6 +1043,7 @@ export const ChatView = forwardRef<ChatViewHandle, ChatViewProps>(function ChatV
         onDraftChange={onDraftChange}
         onNoteSaved={onNoteSaved}
         onPinNote={pinsOn ? pinNote : undefined}
+        voice={voice}
       />
     </div>
     </FormHostContext.Provider>

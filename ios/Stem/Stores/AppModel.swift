@@ -122,6 +122,8 @@ final class Session {
     private(set) var personas: [Persona] = []
     private(set) var models: [ModelSummary] = []
     private(set) var webSearch = false
+    /// Settings → Features → Voice chat; the server refuses a call when it is off.
+    private(set) var voiceAllowed = false
     var prefs = ComposerPrefs.load()
     /// The chat on screen, so a push about it can stay quiet: its reply or
     /// approval card is already in front of the user.
@@ -191,7 +193,10 @@ final class Session {
                 }
             }
         }
-        if let s = try? await client.call("settings:get", as: ServerSettings.self) { webSearch = s.webSearch.main }
+        if let s = try? await client.call("settings:get", as: ServerSettings.self) {
+            webSearch = s.webSearch.main
+            voiceAllowed = s.chatFeatures?.voice.map(\.allow) ?? false
+        }
     }
 
     private func loadPersonas() async {

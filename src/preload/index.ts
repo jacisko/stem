@@ -463,6 +463,8 @@ const api: StemApi = {
     ipcRenderer.invoke('chats:rollbackToTurn', threadId, turnId),
   forkThread: (threadId: string, turnId: string) => ipcRenderer.invoke('chats:forkThread', threadId, turnId),
   compactChat: (threadId: string, instructions?: string) => ipcRenderer.invoke('chats:compact', threadId, instructions),
+  voiceConnect: (offerSdp: string) => ipcRenderer.invoke('voice:connect', offerSdp),
+  voiceCheck: () => ipcRenderer.invoke('voice:check'),
   listPins: (threadId: string) => ipcRenderer.invoke('pins:list', threadId),
   addPin: (threadId: string, input: ChatPinInput) => ipcRenderer.invoke('pins:add', threadId, input),
   updatePin: (threadId: string, pinId: string, patch: ChatPinPatch) =>

@@ -1154,6 +1154,15 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .dictate.listening:hover { background: color-mix(in srgb, var(--danger) 18%, transparent); }
 .dictate.failed { color: var(--danger); }
 @media (prefers-reduced-motion: reduce) { .dictate .spin { animation: none; } }
+/* Voice chat (chat/voice.tsx): accent while a call is live; it breathes
+   while either side is talking and while Stem works on a request. */
+.voice .spin { animation: link-btn-spin 0.9s linear infinite; }
+.voice.live { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.voice.live:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.voice.live.hearing, .voice.live.speaking, .voice.live.working { animation: voice-breathe 1.4s ease-in-out infinite; }
+.voice.failed { color: var(--danger); }
+@keyframes voice-breathe { 50% { background: color-mix(in srgb, var(--accent) 28%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .voice .spin, .voice.live { animation: none !important; } }
 
 .icon-btn {
   position: relative;

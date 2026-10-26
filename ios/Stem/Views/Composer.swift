@@ -33,6 +33,8 @@ struct Composer: View {
     /// Bump to put the caret in the text field (a form's Ask button). Above
     /// zero on first show, it focuses at once.
     var focusRequest = 0
+    /// The chat's voice call and how to start or end it. Nil where voice chat isn't offered.
+    var voice: (call: PhoneVoice, toggle: () -> Void)?
 
     @Environment(Session.self) private var session
     @State private var noteMode = false
@@ -86,6 +88,7 @@ struct Composer: View {
                                 applyNotePrefix(new)
                             }
                         if PhoneDictation.supported { micButton }
+                        if let voice { voiceButton(voice.call, toggle: voice.toggle) }
                     }
                 }
                 .padding(.horizontal, 12)
@@ -264,6 +267,33 @@ struct Composer: View {
 
     /// Tap to dictate, tap again to stop; hold for the language. The first tap
     /// explains this instead of listening.
+    private func voiceButton(_ call: PhoneVoice, toggle: @escaping () -> Void) -> some View {
+        Button(action: toggle) {
+            Group {
+                switch call.phase {
+                case .connecting: ProgressView().controlSize(.small)
+                case .live:
+                    Image(systemName: "waveform.circle.fill")
+                        .symbolEffect(.pulse, isActive: call.activity != .listening)
+                        .foregroundStyle(Color.accentColor)
+                case .idle: Image(systemName: "waveform")
+                }
+            }
+            .font(.system(size: 17))
+            .frame(width: 24, height: 22)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel(call.active ? "End voice chat" : "Voice chat")
+        .onChange(of: call.error) { _, error in
+            if let error { show(error, seconds: 6) }
+        }
+        .onChange(of: call.activity) { _, a in
+            if a == .working { show("Stem is working on it…") }
+        }
+    }
+
     private var micButton: some View {
         Menu {
             Picker("Language", selection: $dictationLocale) {

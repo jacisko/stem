@@ -3989,6 +3989,9 @@ export interface HarnessSettings {
   agents: Record<string, { command?: string }>;
 }
 
+/** Whether a voice call may start or go on; `reason` is shown to the user. */
+export type VoiceAllowance = { ok: true } | { ok: false; reason: string };
+
 /**
  * Coding agents and computer control in chats that run as NO persona
  * (2026-09-27). Personas keep their pins as the whole story — a persona chat
@@ -4031,6 +4034,13 @@ export interface ChatFeatureSettings {
    * also needs an openai-codex sign-in. Absent (an older server) = on.
    */
   images?: { allow: boolean };
+  /**
+   * Voice chat (the composer's voice button): OpenAI's realtime voice model on
+   * the user's ChatGPT subscription, handing every real question to an
+   * ordinary Stem turn. Needs an openai-codex sign-in. Absent (an older
+   * server) = on.
+   */
+  voice?: { allow: boolean };
 }
 
 /**
@@ -5407,6 +5417,10 @@ export interface StemApi {
   forkThread(threadId: string, turnId: string): Promise<{ threadId: string }>;
   compactChat(threadId: string, instructions?: string): Promise<CompactChatResult>;
   /** The chat's pinboard, in board order. Each mutator answers with the fresh list. */
+  /** Voice chat: answer this WebRTC offer with OpenAI's (server/ipc/voice.ts). Throws with the refusal. */
+  voiceConnect(offerSdp: string): Promise<{ sdp: string }>;
+  /** Voice chat: is a call still allowed (switch, sign-in, plan usage left)? Polled during a call. */
+  voiceCheck(): Promise<VoiceAllowance>;
   listPins(threadId: string): Promise<ChatPin[]>;
   addPin(threadId: string, input: ChatPinInput): Promise<ChatPin[]>;
   updatePin(threadId: string, pinId: string, patch: ChatPinPatch): Promise<ChatPin[]>;

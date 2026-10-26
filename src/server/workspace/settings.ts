@@ -145,7 +145,9 @@ const DEFAULTS: ServerSettings = {
     browser: { allow: false, target: null },
     // Image generation: ON for every chat, persona and run with a ChatGPT
     // sign-in until switched off (2026-09-28).
-    images: { allow: true }
+    images: { allow: true },
+    // Voice chat: ON with a ChatGPT sign-in, like images (2026-10-25).
+    voice: { allow: true }
   },
   // Embeddings + reranker for relevance-ranking facts at inject time. Embeddings
   // default to the bundled local model (multilingual, in-process, nothing leaves
@@ -720,7 +722,8 @@ function coerceChatFeatures(raw: unknown): ChatFeatureSettings {
       allow: browser.allow === true,
       target: browserDevice ? { device: browserDevice, ...(browserProfiles ? { profiles: browserProfiles } : {}) } : null
     },
-    images: { allow: obj(r.images).allow !== false }
+    images: { allow: obj(r.images).allow !== false },
+    voice: { allow: obj(r.voice).allow !== false }
   };
 }
 

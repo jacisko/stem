@@ -27,6 +27,7 @@ import { dismissCompactNotice, readCompact, startCompact, subscribeCompact } fro
 import { consumePrefill, consumeSheet, dismissRecorderError, dropPractice, readRecorder, subscribeRecorder } from './recorder-store';
 import { RECORDER_ALPHA_TITLE, RecordSheet } from './RecordSheet';
 import { DictateButton, useDictation } from './dictation';
+import { VoiceButton, type VoiceCall } from './voice';
 
 const MAX_COMPOSER_HEIGHT = 180;
 
@@ -133,6 +134,9 @@ interface ComposerProps {
   /** Pin a note to this chat (`/pin <text>`). Absent where there is no board: a
    *  draft, Quick Chat — there the text takes the normal send path. */
   onPinNote?: (text: string) => Promise<boolean>;
+  /** The window's voice call (App owns it, so it outlives this composer's
+   *  remounts). Absent where voice chat is not offered. */
+  voice?: VoiceCall;
 }
 
 /**
@@ -167,7 +171,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   draftKey,
   onDraftChange,
   onNoteSaved,
-  onPinNote
+  onPinNote,
+  voice
 }: ComposerProps, ref) {
   const [draft, setDraft] = useState(() => (draftKey ? readDraft(draftKey).text : ''));
   const dictation = useDictation(draft, setDraft);
@@ -847,6 +852,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             aria-activedescendant={slash ? `composer-slash-${slash[slashActive].name}` : undefined}
           />
           <DictateButton dictation={dictation} disabled={offline} />
+          {voice ? <VoiceButton voice={voice} disabled={offline} /> : null}
           {running && !noteMode ? (
             <button
               type="button"

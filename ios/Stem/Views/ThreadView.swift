@@ -10,6 +10,8 @@ struct ThreadView: View {
     /// Forms in this chat send from the answer bar over the composer.
     @State private var formHost = MdxFormHost(place: .below)
     @State private var focusRequest = 0
+    /// Voice chat in this chat; leaving the chat ends the call.
+    @State private var voice = PhoneVoice()
     /// Whether the list sits at its end, so growth below follows it there.
     /// Not observed: re-rendering on every scroll step looped the layout.
     @State private var follow = ScrollFollow()
@@ -91,7 +93,8 @@ struct ThreadView: View {
                         onNote: note,
                         onLearn: store.threadId == nil ? nil : { await store.learn(focus: $0) },
                         chatFormat: store.format.map { (value: $0, set: switchFormat) },
-                        focusRequest: focusRequest)
+                        focusRequest: focusRequest,
+                        voice: session.voiceAllowed ? (voice, toggleVoice) : nil)
                 }
             }
         }
@@ -111,6 +114,7 @@ struct ThreadView: View {
             session.visibleThreadId = store.threadId
         }
         .onDisappear {
+            voice.stop()
             store.close()
             if session.visibleThreadId == store.threadId { session.visibleThreadId = nil }
         }
@@ -226,6 +230,12 @@ struct ThreadView: View {
         return await store.send(text: text, previews: files.map(\.preview),
                                 upload: { try await Uploads.upload(files, client: client) },
                                 personaId: personaId, private: draft.isPrivate)
+    }
+
+    private func toggleVoice() {
+        voice.toggle(client: session.client) { [store, draft] request in
+            try await store.ask(request, personaId: store.threadId == nil ? draft.personaId : nil, private: draft.isPrivate)
+        }
     }
 
     private func retract() async {

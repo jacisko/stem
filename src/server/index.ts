@@ -18,6 +18,7 @@ import {
   registerInterStemIpc,
   registerPersonasIpc,
   registerPinsIpc,
+  registerVoiceIpc,
   registerServer,
   registerShareIpc,
   registerWorkspaceIpc,
@@ -411,6 +412,7 @@ function registerIpc(): void {
   registerMemoryIpc(deps);
   registerChatsIpc(deps);
   registerPinsIpc(deps);
+  registerVoiceIpc(deps);
   registerPersonasIpc({ runtime: () => runtime! });
   // Fired by the store on every registry write — editor saves and on-read
   // migrations alike — so every connected client's
