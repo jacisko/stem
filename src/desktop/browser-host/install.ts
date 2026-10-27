@@ -168,7 +168,10 @@ function macBrowserDirs(home: string): BrowserDir[] {
     mac('Brave', 'Brave Browser', 'com.brave.Browser', 'BraveSoftware', 'Brave-Browser'),
     mac('Chromium', 'Chromium', 'org.chromium.Chromium', 'Chromium'),
     mac('Microsoft Edge', 'Microsoft Edge', 'com.microsoft.edgemac', 'Microsoft Edge'),
-    mac('Google Chrome for Testing', 'Google Chrome for Testing', 'com.google.chrome.for.testing', 'Google', 'Chrome for Testing')
+    mac('Google Chrome for Testing', 'Google Chrome for Testing', 'com.google.chrome.for.testing', 'Google', 'Chrome for Testing'),
+    // An Electron browser (electron-chrome-extensions): it reads its own
+    // folder and Chrome's, so with Chrome gone it still finds the manifest.
+    mac('jbrow', 'jbrow', 'sk.awantech.jbrow', 'jbrow')
   ];
   // Arc has been seen reading Chrome's folder rather than its own, so with Arc
   // present Chrome's folder gets the manifest too, installed or not.
@@ -403,11 +406,17 @@ function sandboxLauncher(app: string, appDirs: string[]): boolean {
 }
 
 /**
+ * Registered, but left out of Set up's steps: Chrome for Testing only the dev
+ * harness drives, and jbrow has no extensions page to type in — it loads an
+ * unpacked folder from its own menu.
+ */
+const NO_SETUP_STEPS = new Set(['Google Chrome for Testing', 'jbrow']);
+
+/**
  * The browsers the user can Load unpacked into, for Set up's steps: used on
  * this computer (a data folder) and still installed (an app bundle, or a
- * command on PATH), the default browser first. Not Chrome for Testing, which
- * only the dev harness drives. A sandboxed browser has its own extension
- * folder: it cannot read the shared one.
+ * command on PATH), the default browser first, NO_SETUP_STEPS left out. A
+ * sandboxed browser has its own extension folder: it cannot read the shared one.
  */
 export function setupBrowsers(
   home = homedir(),
@@ -417,7 +426,7 @@ export function setupBrowsers(
 ): SetupBrowser[] {
   const isDefault = (d: BrowserDir) => d.defaultIds.some((id) => id.toLowerCase() === defaultId?.toLowerCase());
   return browserDirs(home, platform)
-    .filter((d) => d.name !== 'Google Chrome for Testing' && existsSync(d.dataDir))
+    .filter((d) => !NO_SETUP_STEPS.has(d.name) && existsSync(d.dataDir))
     .flatMap((d) => {
       if (d.sandbox) return sandboxLauncher(d.sandbox, appDirs) ? [{ d, app: d.sandbox }] : [];
       const launcher = d.launchers.find((l) => appDirs.some((dir) => existsSync(join(dir, l))));

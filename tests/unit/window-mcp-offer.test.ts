@@ -12,6 +12,7 @@ import { sameBrowser, sameTitle } from '../../src/desktop/browser-host';
 describe('browsers on every platform', () => {
   it('knows a browser by its Mac bundle id, Windows exe or Linux id', () => {
     expect(isBrowserApp('Arc', 'company.thebrowser.Browser')).toBe(true);
+    expect(isBrowserApp('jbrow', 'sk.awantech.jbrow')).toBe(true);
     expect(isBrowserApp('Google Chrome', 'chrome')).toBe(true);
     expect(isBrowserApp('Microsoft Edge', 'msedge')).toBe(true);
     expect(isBrowserApp('Google Chrome', 'google-chrome')).toBe(true);

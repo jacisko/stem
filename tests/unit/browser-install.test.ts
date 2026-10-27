@@ -46,6 +46,15 @@ const support = (...p: string[]) => join(home, 'Library', 'Application Support',
 const src = () => ({ extensionSource: ext, hostScript: '/App/dist/main/browser-native-host.js', nodeCommand: '/App/Stem' });
 
 describe('installBrowserControl', () => {
+  it('registers jbrow in its own folder', async () => {
+    mkdirSync(support('jbrow'), { recursive: true });
+    const paths = browserInstallPaths(state);
+    expect((await installBrowserControl(src(), paths, home, 'darwin')).registered).toEqual(['jbrow']);
+    expect(JSON.parse(readFileSync(support('jbrow', 'NativeMessagingHosts', 'com.stem.browser.json'), 'utf8')).path).toBe(
+      paths.wrapperPath
+    );
+  });
+
   it('registers every installed browser, and Arc in Chrome’s folder too', async () => {
     mkdirSync(support('Arc', 'User Data'), { recursive: true });
     mkdirSync(support('BraveSoftware', 'Brave-Browser'), { recursive: true });
@@ -465,11 +474,13 @@ describe('pieces', () => {
     mkdirSync(support('Arc', 'User Data'), { recursive: true });
     mkdirSync(support('BraveSoftware', 'Brave-Browser'), { recursive: true });
     mkdirSync(support('Microsoft Edge'), { recursive: true });
+    mkdirSync(support('jbrow'), { recursive: true });
     const apps = join(home, 'Apps');
     mkdirSync(join(apps, 'Arc.app'), { recursive: true });
     mkdirSync(join(apps, 'Brave Browser.app'), { recursive: true });
+    mkdirSync(join(apps, 'jbrow.app'), { recursive: true });
     // Chrome's folder gets Arc's manifest but Chrome was never used; Edge was
-    // used but is gone.
+    // used but is gone; jbrow loads the folder from its own menu.
     expect(setupBrowsers(home, 'darwin', [apps], null)).toEqual([
       { name: 'Arc', app: 'Arc', extensionsUrl: 'arc://extensions' },
       { name: 'Brave', app: 'Brave Browser', extensionsUrl: 'chrome://extensions' }
