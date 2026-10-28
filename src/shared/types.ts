@@ -334,6 +334,33 @@ export interface LocalProviderSettings {
    * so one left over from another endpoint is inert.
    */
   modelOverrides?: Record<string, ModelOverride>;
+  /**
+   * The paired computer the server runs on, when that is not the machine
+   * hosting stem-server. `baseUrl` is then read ON that computer —
+   * `http://localhost:1234` is its LM Studio — and every request, the model
+   * listing included, travels over that computer's link to Stem
+   * (server/llm-device/). Absent = stem-server reaches `baseUrl` itself.
+   */
+  location?: { deviceId: string };
+}
+
+/** A patch to one local provider; `location: null` moves it back to the server. */
+export type LocalProviderPatch = Omit<Partial<LocalProviderSettings>, 'location'> & {
+  location?: { deviceId: string } | null;
+};
+
+/**
+ * How a local provider's last model check went, as the server recorded it.
+ * `manual` = its model ids were typed by hand, so nothing is ever checked.
+ * `models` is what pi was given, which after a failed check is the list the
+ * last good one found — the reason a dead server can still show models.
+ */
+export interface LocalProviderHealth {
+  state: 'ok' | 'down' | 'manual';
+  error?: string;
+  models: string[];
+  /** Epoch ms of the check. */
+  checkedAt: number;
 }
 
 export type LocalProvidersSettings = {
@@ -2147,6 +2174,50 @@ export interface SetupBrowser {
   extensionsUrl: string;
   /** A Snap or Flatpak browser's own copy of the extension, when it cannot read the shared one. */
   extensionPath?: string;
+}
+
+// ---- Model servers on the user's own devices (LocalProviderSettings.location) ----
+//
+// pi talks HTTP to a loopback relay inside stem-server; the relay hands each
+// request to the device as an addressed control frame, and the device answers
+// with ordered chunk batches over ordinary authenticated RPCs (`llmHost:chunk`).
+// Same rails as the exec and harness paths: off the replay ring, 128-bit
+// single-use request ids. A cancel frame exists because pi aborts streams
+// (the user stops a turn), and an abandoned generation would keep the Mac's
+// GPU busy for nothing.
+
+/** Addressed control frame carrying one HTTP request to the device. */
+export const LLM_REQUEST_FRAME = 'llm-request';
+/** Addressed control frame telling the device the caller hung up. */
+export const LLM_CANCEL_FRAME = 'llm-cancel';
+
+export interface DeviceLlmRequest {
+  requestId: string;
+  /** Absolute URL on the device's side; the device refuses anything off its own network. */
+  url: string;
+  method: 'GET' | 'POST' | 'OPTIONS';
+  headers: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * One batch of a response, `llmHost:chunk`. `seq` orders them (0, 1, 2, …);
+ * the first carries `status` and `headers`, the last `done` or `error`. An
+ * empty batch is a heartbeat while the server is still loading a model.
+ */
+export interface DeviceLlmChunk {
+  requestId: string;
+  seq: number;
+  status?: number;
+  headers?: Record<string, string>;
+  data?: string;
+  done?: true;
+  error?: string;
+}
+
+/** The answer to a chunk: `live: false` = nobody is listening any more, abort. */
+export interface DeviceLlmAck {
+  live: boolean;
 }
 
 // ---- Coding agents on the user's own devices (coding_agent's `device`) ----
@@ -5026,17 +5097,23 @@ export interface StemApi {
    * Enable/disable or repoint a local model server (Ollama / LM Studio). On enable,
    * main probes the server, registers its models with the backend, and restarts it.
    */
-  updateLocalProvider(id: LocalProviderId, patch: Partial<LocalProviderSettings>): Promise<ProviderLoginResult>;
+  updateLocalProvider(id: LocalProviderId, patch: LocalProviderPatch): Promise<ProviderLoginResult>;
   /**
    * Probe a local server's /v1/models without persisting anything. `api` omitted
-   * = auto-detect the flavor from the routes the endpoint exposes.
+   * = auto-detect the flavor from the routes the endpoint exposes. `deviceId`
+   * probes it from that paired computer instead of from the server.
    */
   testLocalProvider(
     id: LocalProviderId,
     baseUrl: string,
     apiKey?: string,
-    api?: LocalProviderApi
+    api?: LocalProviderApi,
+    deviceId?: string | null
   ): Promise<LocalProviderTestResult>;
+  /** How each enabled local provider's last model check went. */
+  localProviderHealth(): Promise<Record<string, LocalProviderHealth>>;
+  /** Check every enabled local provider now (restarting the backend when its list changed). */
+  refreshLocalProviders(): Promise<Record<string, LocalProviderHealth>>;
   /** Remove a provider's credentials (or disable a local provider) and refresh the backend. */
   disconnectProvider(providerId: string): Promise<ProviderLoginResult>;
   /**

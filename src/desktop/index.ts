@@ -27,6 +27,7 @@ import { registerLocalIpc } from './local';
 import { createMcpHost, type McpHost } from './mcp-host';
 import { createExecHost, type ExecHost } from './exec-host';
 import { createDesktopHarnessHost, type DesktopHarnessHost } from './harness-host';
+import { createLlmHost, type LlmHost } from './llm-host';
 import { createComputerHost, type ComputerHost } from './computer-host';
 import { createRecorder, type Recorder } from './recorder';
 import { createComputerBanner } from './computer-host/banner';
@@ -442,6 +443,7 @@ let presence: PresenceHeartbeat | null = null;
 let mcpHost: McpHost | null = null;
 let execHost: ExecHost | null = null;
 let harnessHost: DesktopHarnessHost | null = null;
+let llmHost: LlmHost | null = null;
 let computerHost: ComputerHost | null = null;
 let recorder: Recorder | null = null;
 let browserHost: BrowserHost | null = null;
@@ -591,6 +593,11 @@ app.whenReady().then(async () => {
     invoke: (channel, args) => proxy!.invoke(channel, args)
   });
 
+  // The model servers (LM Studio, Ollama, …) a provider in Settings says run on
+  // THIS computer. No switch: it only reaches this machine's own network, and
+  // only the model-API paths (see llm-host/index.ts).
+  llmHost = createLlmHost({ invoke: (channel, args) => proxy!.invoke(channel, args) });
+
   // The screen actions the server addresses to THIS Mac (a persona's
   // `computer` tool). Same posture as the hosts above: off until the switch
   // in Settings is flipped on this computer.
@@ -645,6 +652,7 @@ app.whenReady().then(async () => {
     harnessHost,
     computerHost,
     browserHost,
+    llmHost,
     mirrorFoldersChanged: () => void mirrorHost?.foldersChanged(),
     sendToMain,
     sendToOverlay: (channel, payload) => quickChat.sendToOverlay(channel, payload),
@@ -854,6 +862,7 @@ app.on('before-quit', (event) => {
   // Same argument for a coding agent's adapter processes: cancel gracefully and
   // close; the sessions themselves survive on this disk.
   void harnessHost?.close();
+  llmHost?.close();
   // And a screen run: the helper is a child of this process too.
   computerHost?.close();
   // And the browser host's socket: the extension's native host retries until Stem is back.

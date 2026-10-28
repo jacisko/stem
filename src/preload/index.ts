@@ -32,7 +32,7 @@ import type {
   LocalEmbedStatus,
   LocalProviderApi,
   LocalProviderId,
-  LocalProviderSettings,
+  LocalProviderPatch,
   LocalRerankStatus,
   FactRerankStatus,
   McpAdminProposal,
@@ -95,10 +95,17 @@ const api: StemApi = {
     ipcRenderer.invoke('auth:respond', requestId, value),
   providerLoginCancel: () => ipcRenderer.invoke('auth:cancel'),
   setApiKey: (provider: ApiKeyProviderId, key: string) => ipcRenderer.invoke('auth:setApiKey', provider, key),
-  updateLocalProvider: (id: LocalProviderId, patch: Partial<LocalProviderSettings>) =>
+  updateLocalProvider: (id: LocalProviderId, patch: LocalProviderPatch) =>
     ipcRenderer.invoke('providers:updateLocal', id, patch),
-  testLocalProvider: (id: LocalProviderId, baseUrl: string, apiKey?: string, api?: LocalProviderApi) =>
-    ipcRenderer.invoke('providers:testLocal', id, baseUrl, apiKey, api),
+  testLocalProvider: (
+    id: LocalProviderId,
+    baseUrl: string,
+    apiKey?: string,
+    api?: LocalProviderApi,
+    deviceId?: string | null
+  ) => ipcRenderer.invoke('providers:testLocal', id, baseUrl, apiKey, api, deviceId),
+  localProviderHealth: () => ipcRenderer.invoke('providers:localHealth'),
+  refreshLocalProviders: () => ipcRenderer.invoke('providers:refreshLocal'),
   disconnectProvider: (providerId: string) => ipcRenderer.invoke('providers:disconnect', providerId),
   checkAuth: (provider: string) => ipcRenderer.invoke('auth:check', provider),
   completeOnboarding: () => ipcRenderer.invoke('auth:completeOnboarding'),

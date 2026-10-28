@@ -5501,6 +5501,11 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
    * needs a process restart — done only when no turn is streaming; otherwise the
    * next sync (or any restart) catches up.
    */
+  async refreshLocalModels(): Promise<void> {
+    this.lastLocalSyncAt = 0;
+    await this.maybeRefreshLocalModels();
+  }
+
   private async maybeRefreshLocalModels(): Promise<void> {
     if (Date.now() - this.lastLocalSyncAt < 30_000) return;
     this.lastLocalSyncAt = Date.now();

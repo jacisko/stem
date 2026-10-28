@@ -35,6 +35,21 @@ Add a provider with:
   every half minute, so a model pulled there later shows up by itself. Type IDs
   to pin a fixed set, which an endpoint that lists no models needs.
 
+Click a provider to open its page: whether it answers, its address, its models,
+and the buttons to check it again, reconnect, or disconnect. The dot on each tile
+is red when the last check got no answer, and the page says why. A server that
+stops answering keeps the models it listed last, so a chat already on one of them
+does not lose its model.
+
+### A model server on your Mac, with Stem on a server
+
+When Stem runs on a server and LM Studio or Ollama runs on your Mac, set **Runs
+on** to your Mac (adding the server from that Mac picks it for you). Stem then
+reaches the model server through the Mac's own connection to Stem, so
+`http://localhost:1234` means LM Studio on the Mac. The Mac has to be awake with
+Stem running; while it isn't, the provider shows as not answering. The Mac only
+forwards model requests to itself or its local network.
+
 The selected model receives the prompt, attachments, and context Stem adds to that
 turn. A cloud model receives that data on its provider’s service. A local model
 sends it to the server address you configured.
@@ -46,7 +61,7 @@ a model that says it can think. Most servers say so; some don’t. A Qwen3 behin
 your own endpoint often arrives looking like a model that cannot reason at all, so
 it answers with thinking switched off and there is no control to switch it on.
 
-Select the connected **Custom** server to get **Per-model overrides**, and tell
+Open the connected **Custom** server to get **Per-model overrides**, and tell
 Stem what the endpoint didn’t:
 
 ```json

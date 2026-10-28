@@ -1,7 +1,13 @@
-import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { LocalProviderApi, LocalProviderId, LocalProviderTestResult, ModelOverride } from '../../shared/types';
+import { randomUUID } from 'node:crypto';
+import type {
+  LocalProviderApi,
+  LocalProviderHealth,
+  LocalProviderId,
+  LocalProviderTestResult,
+  ModelOverride
+} from '../../shared/types';
 import { isCustomProviderId, isLocalProviderId } from '../../shared/providers';
 import { degrade } from '../degrade';
 import { log } from '../log';
@@ -9,6 +15,7 @@ import { parseModelOverrides } from './model-overrides';
 import { piModelsConfigPath } from '../workspace/paths';
 import { readSettings } from '../workspace/settings';
 import { replaceFile } from '../replace-file';
+import { llmRelay } from '../llm-device/router';
 
 // Stem's custom-providers config for the pi backend (models.json under the
 // isolated pi home). OpenAI-compatible servers (Ollama, LM Studio, and a custom
@@ -39,6 +46,8 @@ interface PiModelsConfig {
 
 /** Probe timeout: local servers answer in ms; anything slower is effectively down. */
 const PROBE_TIMEOUT_MS = 2_500;
+/** The same probe from a paired computer: each request crosses the internet twice. */
+const DEVICE_PROBE_TIMEOUT_MS = 10_000;
 
 /**
  * Normalize a user-entered server URL to the server root: no trailing slash, no
@@ -83,12 +92,12 @@ function probeHeaders(api: LocalProviderApi, key?: string): Record<string, strin
  * keep only models listing "tools". Non-Ollama servers (LM Studio, vLLM, …)
  * don't have that endpoint — the check fails and every model is kept.
  */
-async function isToolCapable(base: string, id: string): Promise<boolean> {
+async function isToolCapable(base: string, id: string, timeoutMs: number): Promise<boolean> {
   try {
     const res = await fetch(`${base}/api/show`, {
       method: 'POST',
       body: JSON.stringify({ model: id }),
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     if (!res.ok) return true; // not Ollama → no capability info → keep
     const body = (await res.json()) as { capabilities?: unknown };
@@ -116,10 +125,14 @@ async function isToolCapable(base: string, id: string): Promise<boolean> {
  * very thing being classified, and a header the server doesn't recognize is
  * ignored rather than rejected.
  */
-async function classifyChatRoutes(base: string, apiKey?: string): Promise<{ oc: boolean; am: boolean }> {
+async function classifyChatRoutes(
+  base: string,
+  apiKey: string | undefined,
+  timeoutMs: number
+): Promise<{ oc: boolean; am: boolean }> {
   const key = apiKey?.trim();
   const headers = { ...probeHeaders('openai-completions', key), ...probeHeaders('anthropic-messages', key) };
-  const options = { method: 'OPTIONS', headers, signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) };
+  const options = { method: 'OPTIONS', headers, signal: AbortSignal.timeout(timeoutMs) };
   const [oc, am] = await Promise.allSettled([
     fetch(`${base}/v1/chat/completions`, options),
     fetch(`${base}/v1/messages`, options)
@@ -139,7 +152,8 @@ async function classifyChatRoutes(base: string, apiKey?: string): Promise<{ oc: 
 async function probeOneFlavor(
   baseUrl: string,
   apiKey: string | undefined,
-  api: LocalProviderApi
+  api: LocalProviderApi,
+  timeoutMs: number
 ): Promise<LocalProviderTestResult> {
   const base = normalizeLocalBaseUrl(baseUrl);
   if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Enter a URL like http://localhost:11434.' };
@@ -148,9 +162,9 @@ async function probeOneFlavor(
   try {
     const res = await fetch(listUrl, {
       headers: probeHeaders(api, key),
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+      signal: AbortSignal.timeout(timeoutMs)
     });
-    if (!res.ok) return { ok: false, error: `The server answered ${res.status} ${res.statusText}.` };
+    if (!res.ok) return { ok: false, error: await failureText(res) };
     const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
     const all = (body.data ?? [])
       .map((m) => (typeof m.id === 'string' ? m.id.trim() : ''))
@@ -161,7 +175,7 @@ async function probeOneFlavor(
     const capable =
       key || api === 'anthropic-messages'
         ? all.map(() => true)
-        : await Promise.all(all.map((id) => isToolCapable(base, id)));
+        : await Promise.all(all.map((id) => isToolCapable(base, id, timeoutMs)));
     const models = all.filter((_, i) => capable[i]);
     const skipped = all.length - models.length;
     return { ok: true, api, models, ...(skipped > 0 ? { skippedNoTools: skipped } : {}) };
@@ -195,22 +209,64 @@ async function probeOneFlavor(
 export async function probeLocalProvider(
   baseUrl: string,
   apiKey?: string,
-  api?: LocalProviderApi
+  api?: LocalProviderApi,
+  timeoutMs = PROBE_TIMEOUT_MS
 ): Promise<LocalProviderTestResult> {
-  if (api) return probeOneFlavor(baseUrl, apiKey, api);
+  if (api) return probeOneFlavor(baseUrl, apiKey, api, timeoutMs);
   const base = normalizeLocalBaseUrl(baseUrl);
   if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Enter a URL like http://localhost:11434.' };
-  const routes = await classifyChatRoutes(base, apiKey);
+  const routes = await classifyChatRoutes(base, apiKey, timeoutMs);
   // openai-completions wins ties: pre-existing default and more common.
   const detected: LocalProviderApi | null = routes.oc
     ? 'openai-completions'
     : routes.am
       ? 'anthropic-messages'
       : null;
-  if (detected) return probeOneFlavor(baseUrl, apiKey, detected);
+  if (detected) return probeOneFlavor(baseUrl, apiKey, detected, timeoutMs);
   // Neither OPTIONS resolved (server rejects OPTIONS, or both 404). Fall back
   // to a plain openai-completions listing probe — same behavior as pre-flavor.
-  return probeOneFlavor(baseUrl, apiKey, 'openai-completions');
+  return probeOneFlavor(baseUrl, apiKey, 'openai-completions', timeoutMs);
+}
+
+/**
+ * The status line, plus the server's own message when it sent one. The relay
+ * answers a sleeping Mac with a sentence, and "503 Service Unavailable" alone
+ * would throw that sentence away.
+ */
+async function failureText(res: Response): Promise<string> {
+  const status = `The server answered ${res.status} ${res.statusText}.`.replace(' .', '.');
+  // quiet: a body that won't read leaves the status line, which is still the answer.
+  const body = (await res.json().catch(() => null)) as { error?: { message?: unknown; type?: unknown } | string } | null;
+  const message = typeof body?.error === 'string' ? body.error : body?.error?.message;
+  if (typeof message !== 'string' || !message.trim()) return status;
+  // The relay's own sentences stand alone; its status line is not the model server's.
+  if (typeof body?.error === 'object' && body.error.type === 'stem_relay_error') return message.trim();
+  return `${status} ${message.trim()}`;
+}
+
+/**
+ * {@link probeLocalProvider}, asked from a paired computer: `baseUrl` is read
+ * on that machine, so `http://localhost:1234` is its LM Studio. Goes through
+ * the same relay pi's turns will, so a green test means the real path works.
+ */
+export async function probeLocalProviderOn(
+  deviceId: string,
+  baseUrl: string,
+  apiKey?: string,
+  api?: LocalProviderApi
+): Promise<LocalProviderTestResult> {
+  const base = normalizeLocalBaseUrl(baseUrl);
+  if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Enter a URL like http://localhost:1234.' };
+  const relay = llmRelay();
+  const refusal = await relay.unavailable(deviceId);
+  if (refusal) return { ok: false, error: refusal };
+  const routeId = `test-${randomUUID()}`;
+  relay.setRoute(routeId, { deviceId, baseUrl: base });
+  try {
+    return await probeLocalProvider(await relay.baseFor(routeId), apiKey, api, DEVICE_PROBE_TIMEOUT_MS);
+  } finally {
+    relay.clearRoute(routeId);
+  }
 }
 
 /** The provider block written for an enabled local server. */
@@ -360,6 +416,14 @@ export async function providerIsSpawnable(provider: string): Promise<boolean> {
 // section spans the probes, which take seconds — the window this closes is wide.
 let chain: Promise<unknown> = Promise.resolve();
 
+/** Each enabled local provider's last check, for the status dot in Settings. */
+const health = new Map<string, LocalProviderHealth>();
+
+/** How each enabled local provider's last model check went. */
+export function localProviderHealth(): Record<string, LocalProviderHealth> {
+  return Object.fromEntries(health);
+}
+
 function enqueue<T>(task: () => Promise<T>): Promise<T> {
   const run = chain.then(task, task);
   chain = run.then(
@@ -405,9 +469,12 @@ export function syncModelsConfig(): Promise<boolean> {
     const before = JSON.stringify(config);
 
     for (const id of Object.keys(settings) as LocalProviderId[]) {
-      const { enabled, baseUrl, apiKey, models: manual, api: rawApi } = settings[id];
+      const { enabled, baseUrl, apiKey, models: manual, api: rawApi, location } = settings[id];
+      const relay = llmRelay();
       if (!enabled) {
         delete config.providers[id];
+        health.delete(id);
+        relay.clearRoute(id);
         continue;
       }
       // Backstop for a hand-edited settings.json — the UI refuses a bad fragment
@@ -423,19 +490,36 @@ export function syncModelsConfig(): Promise<boolean> {
       // Hand-entered ids are authoritative: an endpoint that names its models has
       // opted out of discovery, so don't probe it (and don't let a listing endpoint
       // it happens to serve override the user's choice).
+      // A server on a paired computer is reached through the relay: pi gets a
+      // loopback URL, and the relay carries each request to that machine.
+      let base = baseUrl;
+      if (location) {
+        relay.setRoute(id, { deviceId: location.deviceId, baseUrl: normalizeLocalBaseUrl(baseUrl) });
+        base = await relay.baseFor(id);
+      } else relay.clearRoute(id);
       if (manual?.length) {
-        config.providers[id] = localProviderBlock(baseUrl, manual.map((m) => ({ id: m })), apiKey, api, overrides);
+        config.providers[id] = localProviderBlock(base, manual.map((m) => ({ id: m })), apiKey, api, overrides);
+        health.set(id, { state: 'manual', models: [...manual], checkedAt: Date.now() });
         continue;
       }
-      const probe = await probeLocalProvider(baseUrl, apiKey, api);
+      const refusal = location ? await relay.unavailable(location.deviceId) : null;
+      const probe: LocalProviderTestResult = refusal
+        ? { ok: false, error: refusal }
+        : await probeLocalProvider(base, apiKey, api, location ? DEVICE_PROBE_TIMEOUT_MS : PROBE_TIMEOUT_MS);
       const lastKnown = config.providers[id]?.models ?? [];
       const models = probe.ok ? probe.models!.map((m) => ({ id: m })) : lastKnown;
+      health.set(id, {
+        state: probe.ok ? 'ok' : 'down',
+        ...(probe.ok ? {} : { error: probe.error ?? 'The server did not answer.' }),
+        models: models.map((m) => m.id),
+        checkedAt: Date.now()
+      });
       // A block with no models is worse than no block: pi builds its provider
       // list from the models it can see, so an empty one leaves the provider
       // *unknown* — and a spawn asking for it (`--provider ollama`) then dies
       // with "Unknown provider", taking every other provider down with it.
       // Nothing is lost by waiting: the next sync writes it once a probe answers.
-      if (models.length) config.providers[id] = localProviderBlock(baseUrl, models, apiKey, api, overrides);
+      if (models.length) config.providers[id] = localProviderBlock(base, models, apiKey, api, overrides);
       else delete config.providers[id];
     }
 

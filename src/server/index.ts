@@ -50,6 +50,8 @@ import { initBrowserControl } from './startup/browser';
 import { initHarness } from './startup/harness';
 import type { HarnessService } from './harness/service';
 import { registerHarnessIpc } from './harness/ipc';
+import { registerLlmHostIpc } from './llm-device/ipc';
+import { closeLlmRelay } from './llm-device/router';
 import { closeHarnessDeviceRouter, harnessDeviceRouter } from './harness/device-host';
 import { initSkills } from './startup/skills';
 import { cleanWindowContext } from './pi/window-context';
@@ -440,6 +442,7 @@ function registerIpc(): void {
     if (runtime) void nameAfterFirstReply(mailSubjectDeps(), item);
   });
   registerDevicesIpc();
+  registerLlmHostIpc();
   registerUpgradeIpc(createServerUpgrader({ emit: (status) => emit('serverUpgrade:changed', status) }));
   registerHarnessIpc({
     // A device announcing it runs coding agents is the wake-up the mail
@@ -1277,6 +1280,7 @@ export async function startServer(opts: ServerOptions): Promise<ServerHandle> {
       // and failing them with a sentence beats each one waiting out two minutes
       // for a reply that can no longer arrive.
       closeDeviceMcpRouter();
+      closeLlmRelay();
       // And every held device command, for the same reason.
       closeExecDeviceRouter();
       // And every held device coding-agent turn.

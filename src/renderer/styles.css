@@ -4540,7 +4540,6 @@ select.vfield:focus { outline: none; border-radius: var(--radius-sm); box-shadow
   text-align: left;
 }
 .prov-tile:hover { background: color-mix(in srgb, var(--ink) 4%, var(--surface)); }
-.prov-tile.selected { background: var(--sel); border-color: var(--accent); }
 .prov-tile-head { display: flex; align-items: center; justify-content: space-between; }
 .prov-tile b { font-size: var(--fs-13); font-weight: 600; display: block; }
 .prov-tile i {
@@ -4576,7 +4575,12 @@ select.vfield:focus { outline: none; border-radius: var(--radius-sm); box-shadow
 .prov-dot { width: 8px; height: 8px; border-radius: var(--radius-pill); flex: none; }
 .prov-dot.ok { background: var(--success); }
 .prov-dot.bad { background: var(--danger); }
-.prov-actions { display: flex; gap: var(--sp-5); margin-top: var(--sp-4); padding: 0 var(--sp-1); }
+.prov-dot.unknown { background: var(--muted); }
+/* A provider's page (Settings → Models → a tile): the Manage editor's header over settings rows. */
+.prov-detail { display: flex; flex-direction: column; gap: var(--sp-5); margin-bottom: var(--sp-5); }
+.set-vrow .vval .prov-dot { display: inline-block; width: 6px; height: 6px; vertical-align: 1px; margin-right: 2px; }
+.set-vrow .vval.mono, .set-vbody .mono { font-family: var(--font-mono); font-size: var(--fs-11); }
+.set-vbody .mono { color: var(--muted); overflow-wrap: anywhere; }
 
 /* The lead-the-tab banner (a dead provider sign-in). */
 .set-banner {

@@ -68,7 +68,9 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
     a.string,
     a.string,
     a.optional(a.nullish(a.string)),
-    a.optional(a.nullish(a.oneOf(['openai-completions', 'anthropic-messages'])))
+    a.optional(a.nullish(a.oneOf(['openai-completions', 'anthropic-messages']))),
+    // A paired computer to probe from; null/absent = from the server.
+    a.optional(a.nullish(a.string))
   ],
   'providers:updateLocal': [a.string, a.object],
   'providers:disconnect': [a.string],
@@ -138,6 +140,9 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   // land (exec-device/router.ts asAnnouncement/asResult).
   'execHost:announce': [a.object],
   'execHost:result': [a.string, a.object],
+  // One batch of a relayed model response (llm-device/router.ts). No device
+  // id: the caller is the device, and the relay checks it owns the request.
+  'llmHost:chunk': [a.object],
   'harnessHost:announce': [a.object],
   'harnessHost:result': [a.string, a.object],
   'harnessHost:event': [a.object],

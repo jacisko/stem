@@ -368,6 +368,8 @@ export interface ChatBackend extends EventEmitter {
   restart(): Promise<void>;
   /** Whether a turn is streaming — a config change that needs a respawn waits. */
   isTurnRunning(): boolean;
+  /** Re-check the local model servers now, restarting when their list changed. Absent = nothing to check. */
+  refreshLocalModels?(): Promise<void>;
   shutdown(timeoutMs?: number): Promise<void>;
   newConversation(): Promise<void>;
   /** Eagerly spawn the backend process and connect MCP servers so the first turn
