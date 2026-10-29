@@ -141,6 +141,7 @@ export function autoFilePrompt(
     'Rules:',
     `- Reply with one folder path exactly as it is written in the list, or the single word ${NONE}.`,
     `- Only pick a folder the chat clearly belongs in, judging by its name, its description and the chats already in it. When in doubt, reply ${NONE}: a chat left where it is costs nothing, a chat filed in the wrong folder gets lost.`,
+    `- A folder whose description says it takes chats that fit nowhere else is the catch-all: when no other folder clearly fits, pick it instead of ${NONE}.`,
     '- Never make up a folder. Anything not in the list is ignored.',
     '- No quotes, no explanation.',
     '',

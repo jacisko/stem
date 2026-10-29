@@ -35,7 +35,7 @@ import {
   UserPlus,
   Sparkles
 } from 'lucide-react';
-import { MAIL_BETA_TITLE } from '../chats/ChatList';
+import { PERSON_MAIL_BETA_TITLE } from '../chats/ChatList';
 import { isExternalAddress } from '../../shared/types';
 import type {
   InterStemReach,
@@ -1344,9 +1344,11 @@ export const MailComposeView = forwardRef<MailViewHandle, {
       <header className="mail-head">
         <h1>
           {forward ? 'Forward' : 'New mail'}
-          <span className="beta-pill" aria-hidden="true" title={MAIL_BETA_TITLE}>
-            Beta
-          </span>
+          {writingOut && (
+            <span className="beta-pill" aria-hidden="true" title={PERSON_MAIL_BETA_TITLE}>
+              Beta
+            </span>
+          )}
         </h1>
         <span className="mail-compose-spacer" />
         {hasDraft && (

@@ -3997,7 +3997,7 @@ summary.mail-work-action { cursor: pointer; }
 /* The update's call to action sits between the scrolling notes and the buttons:
    read after the notes, never scrolled past, and visually a note rather than a
    fourth button. */
-/* "Beta" beside a feature that ships but is still changing (personas, mail).
+/* "Beta" beside a feature that ships but is still changing (personas, mail to people).
    aria-hidden where it sits inside a control, so the control's name stays the
    word people (and tests) know it by; the explanation rides on the title. */
 .beta-pill { display: inline-block; margin-left: var(--sp-3); padding: 1px var(--sp-3); border-radius: var(--radius-pill); font-size: var(--fs-10); font-weight: 600; letter-spacing: 0.02em; text-transform: none; vertical-align: 1px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }

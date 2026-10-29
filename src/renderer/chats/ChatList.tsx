@@ -106,8 +106,8 @@ const FOLDER_MIME = 'application/x-stem-folder';
  */
 export type ChatsTab = 'inbox' | 'chats';
 
-/** Mail is in beta: the Inbox segment and the compose header both say so. */
-export const MAIL_BETA_TITLE = 'Beta: mail to personas works, but how threads and replies behave is still changing.';
+/** Mail to people (other Stems, by email address) is still in beta; mail to personas is not. */
+export const PERSON_MAIL_BETA_TITLE = 'Beta: mail to people on other Stems works, but how it is set up and delivered is still changing.';
 
 const TABS: { id: ChatsTab; label: string }[] = [
   { id: 'inbox', label: 'Inbox' },
@@ -542,9 +542,14 @@ export function ChatList(props: ChatListProps) {
       if (id && settings.autoFile) setAskOldChats({ id, name: settings.name });
       return;
     }
-    const wasOn = data.folders.find((f) => f.id === dialog.folderId)?.autoFile === true;
+    const before = data.folders.find((f) => f.id === dialog.folderId);
     await props.onUpdateFolder(dialog.folderId, settings);
-    if (settings.autoFile && !wasOn) setAskOldChats({ id: dialog.folderId, name: settings.name });
+    // A new description changes what fits, so the chats earlier sweeps left at
+    // root deserve another look — "Catch-all for whatever fits nowhere else" is
+    // exactly what they are for.
+    const newlyOn = settings.autoFile && before?.autoFile !== true;
+    const redescribed = settings.autoFile && settings.description !== (before?.description ?? '');
+    if (newlyOn || redescribed) setAskOldChats({ id: dialog.folderId, name: settings.name });
   };
 
   const editInput = (value: string, onChange: (v: string) => void, onCommit: () => void) => (
@@ -798,11 +803,6 @@ export function ChatList(props: ChatListProps) {
               onClick={() => setTab(t.id)}
             >
               {t.label}
-              {t.id === 'inbox' && (
-                <span className="beta-pill" aria-hidden="true" title={MAIL_BETA_TITLE}>
-                  Beta
-                </span>
-              )}
               {t.id === 'inbox' && props.mailUnreadCount > 0 && (
                 <span className="seg-count">{props.mailUnreadCount}</span>
               )}

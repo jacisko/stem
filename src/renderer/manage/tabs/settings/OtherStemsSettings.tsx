@@ -3,6 +3,7 @@ import { BrainCircuit, Check, Pencil, ShieldCheck, Sparkles, Trash2, UserX } fro
 import { InfoTip } from '../../../ui/InfoTip';
 import { DisclosureRow, ValueRow } from './rows';
 import { formatFingerprint, useInterStem } from '../../../mail/useInterStem';
+import { PERSON_MAIL_BETA_TITLE } from '../../../chats/ChatList';
 
 /**
  * Settings → Features → Your email address: the verified addresses this Stem
@@ -36,7 +37,12 @@ export function OtherStemsSection() {
   if (status.policy?.mode === 'off') {
     return (
       <>
-        <div className="grp-head">Your email address</div>
+        <div className="grp-head">
+        Your email address
+        <span className="beta-pill" title={PERSON_MAIL_BETA_TITLE}>
+          Beta
+        </span>
+      </div>
         <div className="group">
           <ValueRow label="Turned off by your organization" hint="No mail with other Stems and no public links" />
         </div>
@@ -51,7 +57,12 @@ export function OtherStemsSection() {
 
   return (
     <>
-      <div className="grp-head">Your email address</div>
+      <div className="grp-head">
+        Your email address
+        <span className="beta-pill" title={PERSON_MAIL_BETA_TITLE}>
+          Beta
+        </span>
+      </div>
       <div className="group">
         {allowed && (
           <ValueRow
