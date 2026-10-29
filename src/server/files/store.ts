@@ -5,10 +5,11 @@
 // read tools reach these files because the folder is inside its cwd.
 
 import { constants } from 'node:fs';
-import { copyFile, mkdir, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, extname, join, relative, resolve, sep } from 'node:path';
-import type { FileEntry, FilesListing } from '../../shared/types';
+import { FILES_LISTING_CAP, type FileEntry, type FilesListing, type SkippedFilesDir } from '../../shared/types';
 import { degrade } from '../degrade';
+import { bulkyKindByEntries, bulkyKindByName } from './bulky';
 import { filesRoot } from '../workspace/paths';
 import { isUploadHandle, resolveUploadHandle } from './staging';
 
@@ -21,13 +22,19 @@ function isHidden(name: string): boolean {
  * List the Files folder: top-level subfolders (which drive the drop-overlay
  * bands) plus files at the root and one level inside each subfolder. Files
  * nested deeper are still included (by their rel path) but don't get a band.
+ * Tool folders (virtualenvs, node_modules) are named in `skipped` and not
+ * walked, and the walk stops at FILES_LISTING_CAP files.
  */
 export async function listFiles(): Promise<FilesListing> {
   const rootDir = filesRoot();
   const dirs: string[] = [];
   const files: FileEntry[] = [];
+  const skipped: SkippedFilesDir[] = [];
+  let truncated = false;
+  const relOf = (abs: string) => relative(rootDir, abs).split(sep).join('/');
 
   async function walk(dir: string, topDir: string): Promise<void> {
+    if (truncated) return;
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -40,22 +47,40 @@ export async function listFiles(): Promise<FilesListing> {
       }
       return;
     }
+    if (dir !== rootDir) {
+      const kind = bulkyKindByEntries(entries.map((e) => e.name));
+      if (kind) {
+        skipped.push({ rel: relOf(dir), dir: topDir, kind });
+        return;
+      }
+    }
     for (const e of entries) {
       if (isHidden(e.name)) continue;
       const abs = join(dir, e.name);
       if (e.isDirectory()) {
         if (dir === rootDir) dirs.push(e.name);
+        const kind = bulkyKindByName(e.name);
+        if (kind) {
+          skipped.push({ rel: relOf(abs), dir: dir === rootDir ? '' : topDir, kind });
+          continue;
+        }
         await walk(abs, dir === rootDir ? e.name : topDir);
       } else if (e.isFile()) {
+        if (files.length >= FILES_LISTING_CAP) {
+          truncated = true;
+          return;
+        }
         let size = 0;
+        let mtimeMs: number | undefined;
         try {
-          size = (await stat(abs)).size;
+          const info = await stat(abs);
+          size = info.size;
+          mtimeMs = info.mtimeMs;
         } catch {
           // quiet: unreadable, but the file is there — listing it at size 0 beats
           // dropping it out of the folder the user is looking at.
         }
-        const rel = relative(rootDir, abs).split(sep).join('/');
-        files.push({ rel, name: e.name, dir: dir === rootDir ? '' : topDir, size });
+        files.push({ rel: relOf(abs), name: e.name, dir: dir === rootDir ? '' : topDir, size, mtimeMs });
       }
     }
   }
@@ -63,7 +88,8 @@ export async function listFiles(): Promise<FilesListing> {
   await walk(rootDir, '');
   dirs.sort((a, b) => a.localeCompare(b));
   files.sort((a, b) => a.rel.localeCompare(b.rel));
-  return { root: rootDir, dirs, files };
+  skipped.sort((a, b) => a.rel.localeCompare(b.rel));
+  return { root: rootDir, dirs, files, skipped, ...(truncated ? { truncated } : {}) };
 }
 
 /** A monotonic suffix so two adds in the same millisecond don't collide. */
@@ -188,10 +214,18 @@ export async function readableFilePath(rel: string): Promise<string | null> {
   }
 }
 
-/** Delete a file by its rel path (guards against escaping files/). */
+/**
+ * Delete a file by its rel path (guards against escaping files/). A folder is
+ * removed with everything in it — that is how a skipped tool folder nested
+ * below the top level is taken out. lstat, so a link is unlinked, never followed.
+ */
 export async function removeFile(rel: string): Promise<FilesListing> {
   const abs = filePathWithin(rel);
-  if (abs) await rm(abs, { force: true });
+  if (abs) {
+    // quiet: already gone is the outcome the caller asked for.
+    const info = await lstat(abs).catch(() => null);
+    await rm(abs, { force: true, recursive: info?.isDirectory() ?? false });
+  }
   return listFiles();
 }
 

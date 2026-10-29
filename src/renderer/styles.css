@@ -3497,7 +3497,7 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
    delete (hover/focus only) so it is never the obvious thing to click. */
 .files-group-head .grp-head-add { opacity: 0; transition: opacity var(--motion-fast) ease; }
 .files-group-head:hover .grp-head-add, .files-group-head .grp-head-add:focus-visible { opacity: 1; }
-/* The group name is the fold toggle; the count shows only while folded. */
+/* The group name is the fold toggle; count, size and last change sit beside it. */
 .files-group-toggle {
   display: inline-flex; align-items: center; gap: var(--sp-2);
   min-width: 0; padding: 0; border: 0; background: none;
@@ -3517,6 +3517,8 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
 .files-row .row-action { opacity: 0; transition: opacity var(--motion-fast) ease; }
 .files-row:hover .row-action, .files-row .row-action:focus-visible { opacity: 1; }
 .files-foot { margin: var(--sp-5) var(--sp-2) 0; }
+.files-sort { display: flex; justify-content: flex-end; margin: 0 var(--sp-2) var(--sp-3); }
+.files-sort .vfield { width: auto; }
 
 /* ---- Connected folders (Sources tab → Connected folders sub-tab) ---- */
 .cfolders-head { display: flex; align-items: center; justify-content: space-between; }

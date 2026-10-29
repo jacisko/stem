@@ -8,9 +8,16 @@ import {
   FolderOpen,
   FolderPlus,
   Trash2,
+  Package,
   File as FileIcon
 } from 'lucide-react';
-import { FILES_CONTEXT_LIMIT, type FileEntry, type FilesListing } from '../../../shared/types';
+import {
+  FILES_CONTEXT_LIMIT,
+  FILES_LISTING_CAP,
+  type FileEntry,
+  type FilesListing,
+  type SkippedFilesDir
+} from '../../../shared/types';
 import { useRemoteServer } from '../../hooks/useRemoteServer';
 import { InfoTip } from '../../ui/InfoTip';
 
@@ -34,27 +41,61 @@ function formatSize(bytes: number): string {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
+/** How the subfolder groups are ordered. Top level always comes first. */
+type GroupSort = 'name' | 'size' | 'recent';
+
+interface Group {
+  dir: string;
+  files: FileEntry[];
+  /** Tool folders inside it, named but not walked (server/files/bulky.ts). */
+  skipped: SkippedFilesDir[];
+  bytes: number;
+  /** Newest file mtime in ms; 0 when unknown (empty, or an older server). */
+  newestMs: number;
+}
+
 /**
- * One section per top-level subfolder, root first then alphabetical. Driven by
+ * One section per top-level subfolder, root first, then by `sort`. Driven by
  * `dirs` (not just the dirs that happen to hold files) so a folder you just
  * created stays on screen while it is still empty.
  */
-function buildGroups(listing: FilesListing | null): { dir: string; files: FileEntry[] }[] {
+function buildGroups(listing: FilesListing | null, sort: GroupSort): Group[] {
   if (!listing) return [];
-  const groups = new Map<string, FileEntry[]>([['', []], ...listing.dirs.map((d): [string, FileEntry[]] => [d, []])]);
+  const groups = new Map<string, Group>();
+  const group = (dir: string) => {
+    let g = groups.get(dir);
+    if (!g) groups.set(dir, (g = { dir, files: [], skipped: [], bytes: 0, newestMs: 0 }));
+    return g;
+  };
+  group('');
+  for (const d of listing.dirs) group(d);
   for (const f of listing.files) {
-    const list = groups.get(f.dir);
-    if (list) list.push(f);
-    else groups.set(f.dir, [f]); // a dir that appeared between list and render
+    const g = group(f.dir); // creates a dir that appeared between list and render
+    g.files.push(f);
+    g.bytes += f.size;
+    g.newestMs = Math.max(g.newestMs, f.mtimeMs ?? 0);
   }
-  return [...groups.entries()]
-    .filter(([dir, files]) => dir !== '' || files.length > 0) // no empty "Top level"
-    .sort((a, b) => (a[0] === '' ? -1 : b[0] === '' ? 1 : a[0].localeCompare(b[0])))
-    .map(([dir, files]) => ({ dir, files }));
+  for (const s of listing.skipped ?? []) group(s.dir).skipped.push(s);
+  const order = (a: Group, b: Group) =>
+    sort === 'size' ? b.bytes - a.bytes : sort === 'recent' ? b.newestMs - a.newestMs : 0;
+  return [...groups.values()]
+    .filter((g) => g.dir !== '' || g.files.length > 0 || g.skipped.length > 0) // no empty "Top level"
+    .sort((a, b) => (a.dir === '' ? -1 : b.dir === '' ? 1 : order(a, b) || a.dir.localeCompare(b.dir)));
+}
+
+/** "12 Oct" this year, "12 Oct 2025" before it. */
+function formatDay(ms: number): string {
+  const d = new Date(ms);
+  return d.toLocaleDateString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    ...(d.getFullYear() === new Date().getFullYear() ? {} : { year: 'numeric' })
+  });
 }
 
 export function FilesTab() {
   const [listing, setListing] = useState<FilesListing | null>(null);
+  const [sort, setSort] = useState<GroupSort>('name');
   const [busy, setBusy] = useState(false);
   // Non-null while the inline "new folder" row is open; holds its draft name.
   const [newDir, setNewDir] = useState<string | null>(null);
@@ -124,6 +165,11 @@ export function FilesTab() {
     setListing(await window.stem.removeFile(f.rel));
   }
 
+  async function removeSkipped(s: SkippedFilesDir) {
+    if (!window.confirm(`Delete “${s.rel}” (${s.kind}) from your Files folder?\n\nIt and everything inside it are removed from disk.`)) return;
+    setListing(await window.stem.removeFile(s.rel));
+  }
+
   async function removeDir(dir: string, count: number) {
     const contents =
       count === 0
@@ -156,8 +202,9 @@ export function FilesTab() {
   }
 
   const files = listing?.files ?? [];
-  const groups = buildGroups(listing);
-  const empty = files.length === 0 && (listing?.dirs.length ?? 0) === 0;
+  const groups = buildGroups(listing, sort);
+  const skippedCount = listing?.skipped?.length ?? 0;
+  const empty = files.length === 0 && skippedCount === 0 && (listing?.dirs.length ?? 0) === 0;
   // Groups only get a foldable head when there is more than the top level.
   const headed = groups.some((g) => g.dir !== '') || groups.length > 1;
   const allCollapsed = headed && groups.every((g) => collapsed.has(g.dir));
@@ -244,6 +291,16 @@ export function FilesTab() {
 
       {error && <p className="files-error">{error}</p>}
 
+      {groups.length > 1 && (
+        <div className="files-sort">
+          <select className="vfield" aria-label="Order subfolders by" value={sort} onChange={(e) => setSort(e.target.value as GroupSort)}>
+            <option value="name">By name</option>
+            <option value="size">Largest first</option>
+            <option value="recent">Recently changed first</option>
+          </select>
+        </div>
+      )}
+
       {empty ? (
         <p className="muted">
           Drop a file anywhere on the Stem window and choose “Add to Files”, and a copy is kept
@@ -252,7 +309,7 @@ export function FilesTab() {
         </p>
       ) : (
         <>
-          {groups.map(({ dir, files: entries }) => (
+          {groups.map(({ dir, files: entries, skipped, bytes, newestMs }) => (
             <div key={dir || '__root__'}>
               {headed && (
                 <div className="grp-head files-group-head">
@@ -263,7 +320,10 @@ export function FilesTab() {
                   >
                     <ChevronRight size={12} className={`chat-caret${collapsed.has(dir) ? '' : ' open'}`} />
                     <span>{dir === '' ? 'Top level' : dir}</span>
-                    {collapsed.has(dir) && <em className="files-group-count">{entries.length}</em>}
+                    <em className="files-group-count">
+                      {entries.length.toLocaleString()} · {formatSize(bytes)}
+                      {newestMs > 0 && ` · ${formatDay(newestMs)}`}
+                    </em>
                   </button>
                   {dir !== '' && (
                     <span className="files-group-actions">
@@ -291,7 +351,26 @@ export function FilesTab() {
               )}
               {!(headed && collapsed.has(dir)) && (
                 <div className="group">
-                  {entries.length === 0 ? (
+                  {skipped.map((sk) => (
+                    <div key={sk.rel} className="group-row files-row">
+                      <span className="row-icon">
+                        <Package size={14} />
+                      </span>
+                      <span className="row-main">
+                        <strong title={sk.rel}>{dir ? sk.rel.slice(dir.length + 1) || sk.rel : sk.rel}</strong>
+                        <em>{sk.kind} · not listed to the assistant</em>
+                      </span>
+                      <button
+                        className="icon-action sm row-action"
+                        onClick={() => void removeSkipped(sk)}
+                        title="Delete from Files"
+                        aria-label={`Delete ${sk.rel}`}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                  {entries.length === 0 && skipped.length === 0 ? (
                     <div className="group-row files-row">
                       <span className="muted">Empty — drop files here to fill it.</span>
                     </div>
@@ -340,17 +419,22 @@ export function FilesTab() {
             </div>
           ))}
           <p className="muted files-foot">
+            {listing?.truncated && 'At least '}
             {files.length.toLocaleString()} file{files.length === 1 ? '' : 's'}
+            {listing?.truncated && ` (the listing stops at ${FILES_LISTING_CAP.toLocaleString()})`}
+            {skippedCount > 0 && ` · ${skippedCount} tool folder${skippedCount === 1 ? '' : 's'} not listed`}
             {files.length > FILES_CONTEXT_LIMIT && (
               <>
                 {' · '}
-                only the first {FILES_CONTEXT_LIMIT} are named to the assistant
-                <InfoTip label="Why only the first 100">
+                large subfolders are summarized for the assistant
+                <InfoTip label="How the assistant sees a big folder">
                   Every turn, Stem lists the names of the files in this folder so the assistant
-                  knows what it can read. That list is capped at {FILES_CONTEXT_LIMIT} names to
-                  keep the prompt small — files past the cap are still on disk and still readable
-                  if you mention them, but the assistant won't know they exist on its own. For a
-                  pile this size, a connected folder with indexing on is the better fit.
+                  knows what it can read. Past {FILES_CONTEXT_LIMIT} files, a subfolder with more
+                  than a handful becomes one line with a count and a few names, and the whole list
+                  is capped at {FILES_CONTEXT_LIMIT} lines. Everything is still on disk and readable;
+                  the assistant looks inside a folder when it needs to. Tool folders such as
+                  virtualenvs and node_modules are named but never listed. For a pile this size, a
+                  connected folder with indexing on is the better fit.
                 </InfoTip>
               </>
             )}

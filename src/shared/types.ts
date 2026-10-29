@@ -874,6 +874,9 @@ export interface SkillSummary {
  */
 export const FILES_CONTEXT_LIMIT = 100;
 
+/** Most files one listing walks before it stops and says so; the Files tab cannot show more usefully anyway. */
+export const FILES_LISTING_CAP = 5_000;
+
 /** One file in the Files folder. `rel` is the path relative to files/ (the id). */
 export interface FileEntry {
   /** Path relative to files/, e.g. `Recipes/cake.pdf`. Unique id for removal. */
@@ -884,6 +887,21 @@ export interface FileEntry {
   dir: string;
   /** Bytes on disk, for display. */
   size: number;
+  /** Last modified, in ms. Absent from servers older than the Files cleanup view. */
+  mtimeMs?: number;
+}
+
+/**
+ * A tool folder inside files/ (a virtualenv, node_modules, a cache) that the
+ * listing names once instead of walking — see server/files/bulky.ts.
+ */
+export interface SkippedFilesDir {
+  /** Path relative to files/, e.g. `qwen-test/.venv`. Removable through removeFile. */
+  rel: string;
+  /** Top-level subfolder it is or lives in (the group it shows under), or '' at the root of files/. */
+  dir: string;
+  /** What it is, for people: "Python environment", "Node packages". */
+  kind: string;
 }
 
 /** The Files folder contents: top-level subfolders (drive the drop bands) + files. */
@@ -893,6 +911,10 @@ export interface FilesListing {
   /** Sorted top-level subfolder names. */
   dirs: string[];
   files: FileEntry[];
+  /** Tool folders left out of `files`. Absent from older servers. */
+  skipped?: SkippedFilesDir[];
+  /** True when the walk stopped at FILES_LISTING_CAP, so `files` is not everything. */
+  truncated?: boolean;
 }
 
 // ---- Connected folders (external folders the assistant reads in place) ----

@@ -112,3 +112,53 @@ describe('Files subfolders', () => {
     expect(listing.files.some((f) => f.dir === 'Invoices')).toBe(false);
   });
 });
+
+describe('Files tool folders', () => {
+  // A virtualenv an assistant copied in was 28,885 files: every one walked each
+  // turn, and the 100 names the assistant saw were site-packages.
+  beforeAll(() => {
+    const venv = join(root, 'qwen-test');
+    mkdirSync(join(venv, 'lib', 'python3.12', 'site-packages', 'torch'), { recursive: true });
+    writeFileSync(join(venv, 'pyvenv.cfg'), 'home = /usr/bin');
+    writeFileSync(join(venv, 'lib', 'python3.12', 'site-packages', 'torch', 'x.py'), '');
+    const proj = join(root, 'proj');
+    mkdirSync(join(proj, 'node_modules', 'left-pad'), { recursive: true });
+    writeFileSync(join(proj, 'node_modules', 'left-pad', 'index.js'), '');
+    writeFileSync(join(proj, 'README.md'), 'hi');
+    const big = join(root, 'big');
+    mkdirSync(big, { recursive: true });
+    for (let i = 0; i < 120; i++) writeFileSync(join(big, `f${String(i).padStart(3, '0')}.txt`), '');
+  });
+
+  it('names tool folders once and does not walk into them', async () => {
+    const listing = await store.listFiles();
+    expect(listing.skipped).toEqual([
+      { rel: 'proj/node_modules', dir: 'proj', kind: 'Node packages' },
+      { rel: 'qwen-test', dir: 'qwen-test', kind: 'Python environment' }
+    ]);
+    expect(listing.files.some((f) => f.rel.includes('site-packages') || f.rel.includes('node_modules'))).toBe(false);
+    expect(listing.files.some((f) => f.rel === 'proj/README.md')).toBe(true);
+    expect(listing.dirs).toContain('qwen-test');
+  });
+
+  it('summarizes a big subfolder in the context instead of spending every slot on it', async () => {
+    const ctx = (await inject.buildFilesContext())!;
+    expect(ctx).toContain('- files/big/ — 120 files, e.g. f000.txt, f001.txt, f002.txt');
+    expect(ctx).not.toContain('files/big/f050.txt');
+    expect(ctx).toContain('files/proj/README.md');
+    expect(ctx).toContain('- files/qwen-test/ — Python environment (tooling, contents not listed)');
+  });
+
+  it('deletes a nested tool folder through removeFile', async () => {
+    const listing = await store.removeFile('proj/node_modules');
+    expect(listing.skipped?.some((s) => s.rel === 'proj/node_modules')).toBe(false);
+    expect(listing.files.some((f) => f.rel === 'proj/README.md')).toBe(true);
+  });
+
+  it('reports only tool folders made since a moment', async () => {
+    const { findNewBulky } = await import('../../src/server/files/bulky');
+    expect(await findNewBulky(root, Date.now() + 60_000)).toEqual([]);
+    const all = await findNewBulky(root, 0);
+    expect(all.map((f) => f.rel)).toEqual(['qwen-test']);
+  });
+});

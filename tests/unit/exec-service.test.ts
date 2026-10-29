@@ -1018,3 +1018,31 @@ describe('ExecService blocking and escalation', () => {
     expect((result as { error: string }).error).toBe('The command was cancelled.');
   });
 });
+
+// The backstop for "work in scratch": a command that installs tooling into the
+// Files place is told so in its result, while it can still move it.
+describe('ExecService Files tool-folder note', () => {
+  it('names a node_modules a command just made inside files/, and stays quiet otherwise', async () => {
+    const settings = baseSettings();
+    (settings.exec as unknown as { approvalMode: string }).approvalMode = 'yolo';
+    const service = new ExecService({
+      deviceIsLocal: async () => false,
+      runtime: () => ({}) as unknown as ChatBackend,
+      readSettings: async () => settings,
+      updateExecSettings: async () => settings,
+      emitApprovalRequest: () => undefined,
+      emitApprovalResolved: () => undefined
+    });
+    const files = process.env.STEM_FILES_DIR!;
+    const target = join(files, 'note-probe', 'node_modules', 'left-pad');
+    try {
+      const quiet = await service.handleExecRequest({ command: 'echo hi', threadId: 'tn', isScheduled: false });
+      expect(quiet.ok && quiet.text).not.toContain('Files place');
+      const loud = await service.handleExecRequest({ command: `mkdir -p '${target}'`, threadId: 'tn', isScheduled: false });
+      expect(loud.ok).toBe(true);
+      expect((loud as { text: string }).text).toContain('files/note-probe/node_modules (Node packages)');
+    } finally {
+      rmSync(join(files, 'note-probe'), { recursive: true, force: true });
+    }
+  });
+});
