@@ -210,15 +210,25 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      # Only the app builds: the run also holds the server image's digests and
+      # docker's build records, which download-artifact cannot unpack.
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: '{linux-x64,linux-arm64,mac,windows}'
           merge-multiple: true
+      # The release page says what the app's own release notes say.
+      - name: Release notes for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## / { on = ($2 == v) ; next } on' RELEASE_NOTES.md > release-body.md
+          test -s release-body.md || { echo "RELEASE_NOTES.md has no $version section" >&2; exit 1; }
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           draft: false
-          generate_release_notes: true
+          body_path: release-body.md
 
   # The server image, for docker-compose.yml's `stem` service and the updater
   # that upgrades it (src/server/upgrade.ts). Built natively per arch — native
