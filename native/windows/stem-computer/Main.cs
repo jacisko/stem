@@ -342,8 +342,11 @@ namespace StemComputer
                         AnswerWithScreenshot(id);
                         break;
                     case "peek-window":
-                        Peek.FrontWindow(id, Number(obj, "windowId") is double wid ? (long?)wid : (long?)null);
+                    {
+                        var peekId = Number(obj, "windowId");
+                        Peek.FrontWindow(id, peekId.HasValue ? (long?)(long)peekId.Value : null);
                         break;
+                    }
                     case "peek-text":
                         Emit(new Dictionary<string, object> { { "id", id }, { "ok", true }, { "text", Peek.Text((long)(Number(obj, "windowId") ?? 0), (int)(Number(obj, "maxChars") ?? 20000)) } });
                         break;
