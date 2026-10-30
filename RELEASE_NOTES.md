@@ -12,7 +12,7 @@ Maintainer notes:
   date, tag.
 -->
 
-## 0.7.5 — Unreleased
+## 0.7.5 — 2026-10-30
 
 ### Added
 
@@ -21,7 +21,51 @@ Maintainer notes:
   message, so memory, personas and tools work as when you type, and the conversation stays there
   to read. It runs on your ChatGPT subscription and never uses paid credits: a call won't start,
   and a running one hangs up, once your plan's limit is reached. Turn it off in Settings →
-  Features.
+  Features. Voice chat works on the iPhone too.
+- **Mail with people, made practical.** Mail other Stem users from the iPhone as well as the
+  desktop. Pick people from your contacts, see whether an address is on Stem yet, and mail
+  someone who hasn't joined: the mail waits and goes out once they do. Mails can carry files.
+  **Read it and draft a reply** does both in one step, and for a contact whose key you checked in
+  person Stem can draft replies on its own; nothing goes out until you approve it.
+- **Stem remembers each conversation with a person.** What you agreed with a contact is kept
+  with that contact, and a card shows where the collaboration stands. You can also bring a mail
+  into a conversation with your personas.
+- **Claude Code history as a connected folder.** Add a **Claude Code** folder and Stem keeps a
+  copy of your Claude Code memory and session transcripts from that computer, including Cowork in
+  the Claude app. Only the messages are copied, never tool output, and Stem keeps them after
+  Claude Code deletes old sessions.
+- **Local models through your Mac.** When Stem runs on a server, it can now use LM Studio or
+  another model server running on your paired Mac. Each provider in Settings opens its own page,
+  and the status dot shows whether the server is reachable right now.
+- **Your server upgrades itself.** A server installed from the release image updates to match
+  the newest app version that connects to it, takes a backup first, and goes back to the old
+  version if the upgrade fails. Settings → Server shows where it stands. Servers built from
+  source are left alone.
+- **Several Ask about this window panels at once.** Each window you ask about gets its own panel,
+  so you can keep more than one open.
+- **Browser control in Snap and Flatpak browsers** on Linux.
+
+### Changed
+
+- **Mail to personas is out of beta.** Only mail to people on other Stems still carries the Beta
+  pill.
+- **A catch-all folder.** Give a folder a description like "Catch-all for chats that fit no other
+  folder" and auto-filing sends it the chats that fit nowhere else. Changing a filing folder's
+  description offers to sort your existing chats again.
+- **Mail and scheduled runs look things up first.** They search what Stem remembers before
+  answering, instead of answering from the mail alone.
+- **The status pill says when a chat waits for your approval**, instead of looking busy.
+- **New in Ask about this window** takes a fresh screenshot of the window.
+- **Big share links show download progress** while they load.
+
+### Fixed
+
+- **Files stays tidy.** Stem copied whole working folders, such as Python environments, into
+  Files, where they took gigabytes. It now keeps only finished work there, and the Files list
+  skips tool folders and shows sizes.
+- **Browser profiles can be removed while open**, and you can untick every profile. Removing an
+  open profile uninstalls the Stem extension from it.
+- **Browser control recognises jbrow** as a browser.
 
 ## 0.7.1 — 2026-10-23
 
