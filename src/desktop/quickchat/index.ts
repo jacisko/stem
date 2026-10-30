@@ -649,18 +649,19 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   /**
    * The panel's New: a fresh question about the window it is docked beside
    * gets a fresh picture and text of it, not the ones from the last summon.
-   * Null when the panel is not a window panel, or the window has closed.
+   * `window: null` once the window has closed; null when the panel is not
+   * docked beside a window, so it keeps whatever window it shows.
    */
-  async function repeekPanelWindow(panel: Panel): Promise<QuickChatWindow | null> {
+  async function repeekPanelWindow(panel: Panel): Promise<{ window: QuickChatWindow | null } | null> {
     const anchored = panel.peek;
     if (!anchored) return null;
     const peeked = await peekFrontWindow(anchored.window.windowId);
-    if (!peeked) return null;
+    if (!peeked) return { window: null };
     const w = peeked.window;
     await addBrowserState(w);
     const text = w.missing.includes('accessibility') ? Promise.resolve(null) : readWindowText(w.windowId);
     panel.peek = { window: w, bounds: peeked.bounds, text };
-    return w;
+    return { window: w };
   }
 
   /** What the model is told about the window a prompt was sent with. */

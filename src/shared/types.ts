@@ -5912,8 +5912,9 @@ export interface StemApi {
    *  overlay + raises the HUD, pre-creating a thread for a fresh session). */
   runQuickChat(prompt: QuickChatPrompt): Promise<StartTurnResult>;
   /** Overlay → main: forget the current overlay thread so the next prompt is fresh. */
-  /** Forget the panel's thread; a window panel answers with a fresh capture of its window (null: none, or it closed). */
-  newQuickChatThread(): Promise<QuickChatWindow | null>;
+  /** Forget the panel's thread. A window panel answers with a fresh capture of its window (`window: null`
+   *  once it has closed); null when there is nothing new to say, and the panel keeps the window it has. */
+  newQuickChatThread(): Promise<{ window: QuickChatWindow | null } | null>;
   /** Overlay → main: hand the conversation off to the main window. */
   handoffQuickChat(payload: QuickChatHandoff): Promise<void>;
   /** Overlay: main requests an atomic snapshot before changing event ownership. */

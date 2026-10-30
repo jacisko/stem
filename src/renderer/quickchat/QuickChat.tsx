@@ -481,8 +481,8 @@ export function QuickChat() {
       const fresh = await window.stem.newQuickChatThread();
       resetSession();
       // A fresh picture of the same window; a closed window drops the chip.
-      summonedWindowRef.current = fresh;
-      if (fresh) setWindowChip(fresh);
+      if (fresh) summonedWindowRef.current = fresh.window;
+      if (summonedWindowRef.current) setWindowChip(summonedWindowRef.current);
       requestAnimationFrame(() => inputRef.current?.focus());
     } catch (e) {
       if (oldThreadId) ignoredThreadIdsRef.current.delete(oldThreadId);

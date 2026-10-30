@@ -1038,7 +1038,8 @@ describe('ExecService Files tool-folder note', () => {
     try {
       const quiet = await service.handleExecRequest({ command: 'echo hi', threadId: 'tn', isScheduled: false });
       expect(quiet.ok && quiet.text).not.toContain('Files place');
-      const loud = await service.handleExecRequest({ command: `mkdir -p '${target}'`, threadId: 'tn', isScheduled: false });
+      const mkdir = process.platform === 'win32' ? `mkdir "${target}"` : `mkdir -p '${target}'`;
+      const loud = await service.handleExecRequest({ command: mkdir, threadId: 'tn', isScheduled: false });
       expect(loud.ok).toBe(true);
       expect((loud as { text: string }).text).toContain('files/note-probe/node_modules (Node packages)');
     } finally {

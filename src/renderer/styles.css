@@ -3543,7 +3543,8 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
 .cfolder-add-option:disabled { opacity: 0.5; cursor: default; }
 .cfolder-add-option .muted { font-size: var(--fs-12); }
 /* The connect wizard (ConnectFolderWizard): numbered steps, chosen option ringed. */
-.cfolder-wizard { width: min(480px, calc(100vw - 48px)); outline: none; }
+/* A short window (a 768px-high laptop screen) still reaches the wizard's buttons. */
+.cfolder-wizard { width: min(480px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow-y: auto; outline: none; }
 .wizard-steps { display: flex; gap: var(--sp-6); margin: 0 0 var(--sp-7); padding: 0; list-style: none; font-size: var(--fs-12); color: var(--muted); }
 .wizard-steps li { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .wizard-steps li.active { color: var(--ink); font-weight: 600; }
