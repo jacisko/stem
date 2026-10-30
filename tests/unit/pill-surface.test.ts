@@ -27,7 +27,8 @@ vi.mock('../../src/desktop/platform', () => ({
   presentOverlayWindow: () => { mock.overlay.visible = true; }, quickChatSummonCommand: () => 'stem'
 }));
 vi.mock('../../src/desktop/ipc-bridge', () => ({
-  handleLocal: (name: string, fn: (...args: unknown[]) => unknown) => mock.handlers.set(name, fn)
+  handleLocal: (name: string, fn: (...args: unknown[]) => unknown) => mock.handlers.set(name, fn),
+  handleLocalFrom: (name: string, fn: (...args: unknown[]) => unknown) => mock.handlers.set(name, fn)
 }));
 
 import { createQuickChat } from '../../src/desktop/quickchat';
@@ -163,5 +164,34 @@ describe('the shared HUD window', () => {
     expect(mock.hud.webContents.send).toHaveBeenLastCalledWith('quickchat:status',
       expect.objectContaining({ label: 'Answer ready', reveal: 'main' }));
     expect(mock.chime).toHaveBeenCalledTimes(1);
+  });
+
+  it('says a main-window turn is waiting on an approval card until it is answered', () => {
+    const { surface, event } = fixture();
+    const last = () => mock.hud.webContents.send.mock.calls.at(-1)?.[1];
+    event('item/started', 'local');
+    expect(last()).toMatchObject({ phase: 'working', reveal: 'main' });
+    surface.sendToOverlay('exec:approvalRequest', { id: 'ask', threadId: 'chat', command: 'rm -rf build' });
+    expect(last()).toMatchObject({ phase: 'waiting', label: 'Waiting for your approval', reveal: 'main' });
+    event('item/started', 'local');
+    expect(last()).toMatchObject({ phase: 'waiting' });
+    surface.sendToOverlay('exec:approvalResolved', { id: 'ask' });
+    expect(last()).toMatchObject({ phase: 'working', label: 'Working…' });
+  });
+
+  it('holds a hidden Quick Chat pill at waiting while its thread has a card open', async () => {
+    const { surface, event } = fixture();
+    const last = () => mock.hud.webContents.send.mock.calls.at(-1)?.[1];
+    await mock.handlers.get('quickchat:run')!(undefined, { input: 'hello', turnId: 'quick' });
+    event('item/started', 'quick');
+    // A replayed card does not re-summon the panel, so the pill must carry it.
+    surface.sendToOverlay('harness:approvalRequest', { id: 'h1', threadId: 'chat', options: [] });
+    expect(last()).toMatchObject({ phase: 'waiting' });
+    event('item/started', 'quick');
+    expect(last()).toMatchObject({ phase: 'waiting' });
+    surface.sendToOverlay('harness:approvalResolved', { id: 'h1' });
+    expect(last()).toMatchObject({ phase: 'working' });
+    event('turn/completed', 'quick');
+    expect(last()).toMatchObject({ phase: 'finished', label: 'Answer ready' });
   });
 });

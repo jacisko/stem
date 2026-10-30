@@ -28,6 +28,10 @@ body {
   text-align: center;
   padding: 18vh 0;
 }
+.viewer-progress {
+  width: min(240px, 100%);
+  accent-color: var(--accent, currentColor);
+}
 .viewer-message h1 {
   margin: 0 0 8px;
   font-size: 1.5em;

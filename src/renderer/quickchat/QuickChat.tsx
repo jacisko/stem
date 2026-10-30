@@ -478,9 +478,11 @@ export function QuickChat() {
       if (running) await onInterrupt();
       resolvedOldId = oldThreadId ?? pending?.threadId ?? threadIdRef.current;
       if (resolvedOldId) ignoredThreadIdsRef.current.add(resolvedOldId);
-      await window.stem.newQuickChatThread();
+      const fresh = await window.stem.newQuickChatThread();
       resetSession();
-      if (summonedWindowRef.current) setWindowChip(summonedWindowRef.current);
+      // A fresh picture of the same window; a closed window drops the chip.
+      summonedWindowRef.current = fresh;
+      if (fresh) setWindowChip(fresh);
       requestAnimationFrame(() => inputRef.current?.focus());
     } catch (e) {
       if (oldThreadId) ignoredThreadIdsRef.current.delete(oldThreadId);

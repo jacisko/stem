@@ -11,6 +11,8 @@ import {
   EXEC_SAVE_FRAME,
   HARNESS_CANCEL_FRAME,
   HARNESS_REQUEST_FRAME,
+  LLM_CANCEL_FRAME,
+  LLM_REQUEST_FRAME,
   MCP_ASSIGNMENTS_FRAME,
   MCP_REQUEST_FRAME,
   MIRROR_FOLDERS_FRAME,
@@ -22,6 +24,7 @@ import {
   type DeviceSaveRequest,
   type DeviceHarnessCancel,
   type DeviceHarnessRequest,
+  type DeviceLlmRequest,
   type DeviceMcpRequest,
   type ExecApprovalRequest,
   type HarnessApprovalRequest,
@@ -323,6 +326,8 @@ export interface ProxyDeps {
   revealMainWindow(): void;
   /** OS-level attention nudge (dock bounce / taskbar flash). */
   requestAttention(): void;
+  /** A system notification for another person's mail (inter-Stem). */
+  notifyPersonMail?(mail: { conversationId: string; from: string; name?: string; subject?: string; joined?: boolean }): void;
   /** The implicit Quick Chat hand-off, run before a thread is opened. */
   threadOpened(threadId: string): Promise<void>;
   /**
@@ -358,6 +363,8 @@ export interface ProxyDeps {
   computerHost: DeviceComputerHostBinding;
   /** Hands the browser actions addressed to this device to the extension. Optional so older test fakes stand. */
   browserHost?: DeviceBrowserHostBinding;
+  /** Makes the model-server requests relayed to this device. Optional so older test fakes stand. */
+  llmHost?: { onRequest(request: DeviceLlmRequest): void; onCancel(cancel: { requestId: string }): void };
   /** A folder this device mirrors changed mode or was disconnected elsewhere: re-read the registry. */
   mirrorFoldersChanged?(): void;
   /** Quick Chat settings were persisted: apply the parts that are not settings. */
@@ -801,6 +808,18 @@ export function createServerProxy(deps: ProxyDeps): ServerProxy {
       if (request) deps.harnessHost.onRequest(request);
       return;
     }
+    // A request for a model server reached through THIS machine, and the
+    // hang-up of one. Same rules as the frames around it.
+    if (name === LLM_REQUEST_FRAME) {
+      const request = asLlmRequest(data);
+      if (request) deps.llmHost?.onRequest(request);
+      return;
+    }
+    if (name === LLM_CANCEL_FRAME) {
+      const requestId = (data as { requestId?: unknown } | null)?.requestId;
+      if (typeof requestId === 'string' && requestId) deps.llmHost?.onCancel({ requestId });
+      return;
+    }
     if (name === HARNESS_CANCEL_FRAME) {
       const turnId = (data as { turnId?: unknown } | null)?.turnId;
       if (typeof turnId === 'string' && turnId) deps.harnessHost.onCancel({ turnId });
@@ -918,6 +937,22 @@ export function createServerProxy(deps: ProxyDeps): ServerProxy {
       ...(typeof frame.profile === 'string' && frame.profile ? { profile: frame.profile } : {}),
       // A malformed list is still a limit: kept (empty), never widened to every profile.
       ...(frame.allowed !== undefined ? { allowed: allowed ?? [] } : {})
+    };
+  }
+
+  function asLlmRequest(data: unknown): DeviceLlmRequest | null {
+    const frame = data as Partial<DeviceLlmRequest> | null;
+    if (!frame || typeof frame.requestId !== 'string' || !frame.requestId) return null;
+    if (typeof frame.url !== 'string' || !frame.url) return null;
+    if (frame.method !== 'GET' && frame.method !== 'POST' && frame.method !== 'OPTIONS') return null;
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(frame.headers ?? {})) if (typeof v === 'string') headers[k] = v;
+    return {
+      requestId: frame.requestId,
+      url: frame.url,
+      method: frame.method,
+      headers,
+      ...(typeof frame.body === 'string' ? { body: frame.body } : {})
     };
   }
 
@@ -1057,6 +1092,10 @@ export function createServerProxy(deps: ProxyDeps): ServerProxy {
         return;
       case 'client:requestAttention':
         deps.requestAttention();
+        return;
+      case 'interstem:mail':
+        deps.notifyPersonMail?.(payload as Parameters<NonNullable<typeof deps.notifyPersonMail>>[0]);
+        deps.sendToMain(channel, payload);
         return;
       // Approval cards: both surfaces mount them, and the overlay hides itself
       // while a turn runs — bring it back when the request belongs to its thread,

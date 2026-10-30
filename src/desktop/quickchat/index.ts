@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { globalShortcut, ipcMain, shell, type BrowserWindow } from 'electron';
+import { globalShortcut, ipcMain, shell, type BrowserWindow, type WebContents } from 'electron';
 import { log } from '../../server/log';
-import { handleLocal } from '../ipc-bridge';
+import { handleLocal, handleLocalFrom } from '../ipc-bridge';
 import {
   isWaylandSession,
   playFinishChime as platformFinishChime,
@@ -107,19 +107,19 @@ export interface QuickChatSurface {
   toggle(): void;
   /** "Ask about this window" — its shortcut, or `stem --ask-window` (the Wayland path). */
   askAboutWindow(): void;
-  /** Is the overlay on screen? (app.on('activate') asks before reopening the app.) */
+  /** Is any Quick Chat panel on screen? (app.on('activate') asks before reopening the app.) */
   overlayVisible(): boolean;
   /** Apply the parts of a Quick Chat settings change no other layer can. */
   applySettings(patch: Partial<QuickChatSettings>, next: QuickChatSettings): void;
   /** What Settings needs to tell the truth about the summon key. */
   shortcutStatus(): QuickChatShortcutStatus;
-  /** Push on a channel the overlay window renders. No-op when it is gone. */
+  /** Push on a channel the overlay windows render (approval asks go to one panel). */
   sendToOverlay(channel: string, payload: unknown): void;
   /** Push on a channel the HUD pill renders (theme changes). No-op when it is gone. */
   sendToHud(channel: string, payload: unknown): void;
   /** Let go of the window helper (app quit). */
   stop(): void;
-  /** Bring the overlay back when it owns `threadId` (approval cards). */
+  /** Bring back the panel that owns `threadId` (approval cards). */
   revealIfOwns(threadId: string | null | undefined): void;
   /**
    * Route a backend thread event to this client's windows. Returns true when a
@@ -137,9 +137,79 @@ export interface QuickChatSurface {
   hideMainHud(): void;
 }
 
+/**
+ * One Quick Chat panel: an overlay window and the conversation it owns. The
+ * plain panel (the Quick Chat shortcut) sits centred and always exists; every
+ * window asked about gets a panel of its own, docked beside that window, so
+ * several can be open — and answering — at once.
+ */
+interface Panel {
+  win: BrowserWindow | null;
+  /**
+   * The window this panel was asked about: it docks beside it (never on top
+   * when the screen has room) and follows it while shown, and the first prompt
+   * sent with its chip carries its text. Null for the plain panel.
+   */
+  peek: { window: QuickChatWindow; bounds: DockRect; text: Promise<string | null> } | null;
+  /** Thread ownership and turn state — see OverlaySession. */
+  readonly overlay: OverlaySession;
+  readonly handoffBarrier: QuickChatHandoffBarrier;
+  /** A manual reset requested while the old turn was still settling. Keep
+   * ownership long enough to route that turn's terminal event, then release it. */
+  readonly resetBarrier: QuickChatResetBarrier;
+  turnId: string | null;
+  /** Polls the anchored window's frame while the panel is on screen. */
+  followTimer: NodeJS.Timeout | null;
+  /** The last summon: the longest-unused hidden panel is the one let go. */
+  lastShown: number;
+}
+
+/** Window panels kept at most; past this the longest-unused idle hidden one closes. */
+const MAX_WINDOW_PANELS = 6;
+
+function newPanel(win: BrowserWindow | null): Panel {
+  return {
+    win,
+    peek: null,
+    overlay: new OverlaySession(),
+    handoffBarrier: new QuickChatHandoffBarrier(),
+    resetBarrier: new QuickChatResetBarrier(),
+    turnId: null,
+    followTimer: null,
+    lastShown: 0
+  };
+}
+
+function live(win: BrowserWindow | null | undefined): win is BrowserWindow {
+  return !!win && !win.isDestroyed();
+}
+
+function onScreen(panel: Panel): boolean {
+  return live(panel.win) && panel.win.isVisible();
+}
+
+/** Permission asks: shown by the panel whose thread asked, else by the plain one. */
+const APPROVAL_REQUESTS = new Set([
+  'exec:approvalRequest',
+  'harness:approvalRequest',
+  'mcp:adminApproval',
+  'instructions:approvalRequest',
+  'skills:approvalRequest'
+]);
+
+/** Answers (or expiries) of those asks: the pill stops waiting on them. */
+const APPROVAL_RESOLUTIONS = new Set([
+  'exec:approvalResolved',
+  'harness:approvalResolved',
+  'mcp:adminApprovalResolved',
+  'instructions:approvalResolved',
+  'skills:approvalResolved'
+]);
+
+const WAITING: QuickChatStatus = { phase: 'waiting', label: 'Waiting for your approval' };
+
 export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
-  let overlayWindow: BrowserWindow | null = null;
-  /** Bottom-left status pill shown while the overlay is hidden and a turn runs. */
+  /** Bottom-left status pill shown while a panel is hidden and its turn runs. */
   let hudWindow: BrowserWindow | null = null;
 
   /** The currently-registered global accelerator, so we can unregister on change. */
@@ -155,34 +225,27 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   let currentWindowShortcut: string | null = null;
   let desiredWindowShortcut: string | null = null;
 
-  // ---- "Ask about this window" ----
+  // ---- Quick Chat panels ----
   //
-  // The window the overlay's session was summoned for: the panel docks beside
-  // it (never on top when the screen has room) and follows it while shown, and
-  // the first prompt sent with its chip carries its text. Cleared whenever the
-  // session starts fresh without one.
-  let peek: { window: QuickChatWindow; bounds: DockRect; text: Promise<string | null> } | null = null;
+  // Each panel owns one live conversation at a time. While it owns a thread, that
+  // thread's backend events route to the panel (not the main window) and drive the
+  // status HUD. Hand-off (button, or opening the thread from the sidebar) routes
+  // events to the main window from then on. All of that state lives in the panel's
+  // OverlaySession — every mutation is a named transition, never a bare flag.
+  const plain = newPanel(null);
+  /** "Ask about this window" panels, by the id of the window each was asked about. */
+  const windowPanels = new Map<number, Panel>();
+  /**
+   * A hidden, already-loaded overlay waiting to become the next window panel, so
+   * asking about a new window is as instant as re-summoning a known one.
+   */
+  let spare: BrowserWindow | null = null;
   /** A press is still capturing: a second press waits its turn instead of racing it. */
   let peeking = false;
-  /** Polls the anchored window's frame while the overlay is on screen. */
-  let followTimer: NodeJS.Timeout | null = null;
   /** Cached "show overlay on all Spaces" setting, applied once per overlay window. */
   let overlayOnAllDisplays = true;
   /** Cached inactivity timeout (ms) after which a summon starts a fresh thread. */
   let newThreadTimeoutMs = 5 * 60_000;
-
-  // ---- Quick Chat session ownership ----
-  //
-  // The overlay owns one live conversation at a time. While it owns a thread, that
-  // thread's backend events route to the overlay (not the main window) and drive the
-  // status HUD. Hand-off (button, or opening the thread from the sidebar) routes
-  // events to the main window from then on. All of that state lives in `overlay`
-  // (see OverlaySession) — every mutation is a named transition, never a bare flag.
-  const overlay = new OverlaySession();
-  const overlayHandoffBarrier = new QuickChatHandoffBarrier();
-  /** A manual reset requested while the old overlay turn was still settling. Keep
-   * ownership long enough to route that turn's terminal event, then release it. */
-  const overlayResetBarrier = new QuickChatResetBarrier();
 
   // ---- Follow-me status pill (main-window threads) ----
   //
@@ -195,27 +258,120 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   let finishSound = false;
   /** Locally initiated interactive turns shared by both HUD paths. */
   const pillTurns = new PillTurns();
-  let overlayTurnId: string | null = null;
   /** Ownership + last phase of the shared pill (chime edge detection) — see HudPill. */
   const hud = new HudPill();
+  /** The panel the pill speaks for while Quick Chat owns it (its click reveals it). */
+  let hudPanel: Panel | null = null;
+  /** Unanswered approval cards, id → asking thread: the pill says so instead of "Working…". */
+  const approvals = new Map<string, string>();
 
-  function applyOverlayWorkspaceVisibility(): void {
-    if (overlayWindow && !overlayWindow.isDestroyed()) {
-      setOverlayWorkspaceVisibility(overlayWindow, overlayOnAllDisplays);
-    }
+  function awaitingApproval(threadId: string | null | undefined): boolean {
+    if (!threadId) return false;
+    for (const t of approvals.values()) if (t === threadId) return true;
+    return false;
   }
 
-  function ensureOverlayWindow(): BrowserWindow {
-    if (!overlayWindow || overlayWindow.isDestroyed()) {
-      overlayWindow = createOverlayWindow({
-        installNavigationGuards: deps.installNavigationGuards,
-        visibleOnAllWorkspaces: overlayOnAllDisplays
-      });
-      overlayWindow.on('closed', () => {
-        overlayWindow = null;
-      });
+  function dropApprovals(threadId: string | null | undefined): void {
+    for (const [id, t] of approvals) if (t === threadId) approvals.delete(id);
+  }
+
+  /** A card was raised or answered: re-push the pill that speaks for its thread. */
+  function noteApproval(channel: string, payload: unknown): void {
+    const p = (payload ?? {}) as { id?: unknown; threadId?: unknown };
+    if (p.id === undefined || p.id === null) return;
+    const id = String(p.id);
+    let threadId: string | undefined;
+    if (APPROVAL_REQUESTS.has(channel)) {
+      if (typeof p.threadId !== 'string') return;
+      threadId = p.threadId;
+      approvals.set(id, threadId);
+    } else {
+      threadId = approvals.get(id);
+      if (!approvals.delete(id)) return;
     }
-    return overlayWindow;
+    const panel = ownerOf(threadId);
+    if (panel) {
+      if (hudShows(panel) && !onScreen(panel) && hud.lastPhase !== 'finished')
+        showPanelHud(panel, { phase: 'working', label: 'Working…' });
+    } else syncMainHud();
+  }
+
+  /** A panel's pill push, held at "waiting" while its thread has a card open. */
+  function showPanelHud(panel: Panel, status: QuickChatStatus): void {
+    const waiting = status.phase !== 'finished' && awaitingApproval(panel.overlay.threadId);
+    showHud(waiting ? WAITING : status, 'quickchat', panel);
+  }
+
+  function panels(): Panel[] {
+    return [plain, ...windowPanels.values()];
+  }
+
+  /** Every overlay window, the spare included: theme and connection changes reach all. */
+  function overlayWindows(): BrowserWindow[] {
+    return [...panels().map((p) => p.win), spare].filter(live);
+  }
+
+  /** The panel that owns `threadId`, if any does. */
+  function ownerOf(threadId: string | null | undefined): Panel | undefined {
+    return panels().find((p) => p.overlay.owns(threadId));
+  }
+
+  /** The panel a call came from. Unknown callers (tests) speak for the plain one. */
+  function panelFor(sender: WebContents | undefined): Panel {
+    return (sender && panels().find((p) => live(p.win) && p.win.webContents === sender)) || plain;
+  }
+
+  function createPanelWindow(): BrowserWindow {
+    return createOverlayWindow({
+      installNavigationGuards: deps.installNavigationGuards,
+      visibleOnAllWorkspaces: overlayOnAllDisplays
+    });
+  }
+
+  function panelWindow(panel: Panel): BrowserWindow {
+    if (panel === plain && !live(plain.win)) {
+      const win = createPanelWindow();
+      win.on('closed', () => {
+        if (plain.win === win) plain.win = null;
+      });
+      plain.win = win;
+    }
+    return panel.win!;
+  }
+
+  function ensureSpare(): void {
+    if (live(spare)) return;
+    const win = createPanelWindow();
+    win.on('closed', () => {
+      if (spare === win) spare = null;
+    });
+    spare = win;
+  }
+
+  /**
+   * A panel for a window asked about for the first time. Too many already: the
+   * longest-unused hidden one with nothing running closes first.
+   */
+  function openWindowPanel(windowId: number): Panel {
+    if (windowPanels.size >= MAX_WINDOW_PANELS) {
+      const idle = [...windowPanels.values()]
+        .filter((p) => !onScreen(p) && !p.overlay.turnRunning && !p.resetBarrier.pending)
+        .sort((a, b) => a.lastShown - b.lastShown)[0];
+      idle?.win?.destroy();
+    }
+    const win = live(spare) ? spare : createPanelWindow();
+    spare = null;
+    const panel = newPanel(win);
+    windowPanels.set(windowId, panel);
+    win.on('closed', () => {
+      stopFollowing(panel);
+      panel.win = null;
+      if (windowPanels.get(windowId) === panel) windowPanels.delete(windowId);
+      if (hudPanel === panel) hudPanel = null;
+    });
+    // The next window's panel loads while this one is in use.
+    setTimeout(ensureSpare, 1_000);
+    return panel;
   }
 
   function ensureHudWindow(): BrowserWindow {
@@ -228,8 +384,8 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     return hudWindow;
   }
 
-  function sendToOverlay(channel: string, payload?: unknown): void {
-    if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.webContents.send(channel, payload);
+  function sendTo(panel: Panel, channel: string, payload?: unknown): void {
+    if (live(panel.win)) panel.win.webContents.send(channel, payload);
   }
 
   /** Play the finish chime: macOS system sound, or the HUD window's bundled asset. */
@@ -239,16 +395,18 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
 
   /**
    * Show the HUD pill (bottom-left of the display under the cursor) and push status.
-   * `owner` records whether Quick Chat or the follow-me path is driving it. The chime
-   * fires once, on the transition into 'finished' while the pill is visible.
+   * `owner` records whether Quick Chat (and which panel) or the follow-me path is
+   * driving it. The chime fires once, on the transition into 'finished' while the
+   * pill is visible.
    */
-  function showHud(status: QuickChatStatus, owner: 'quickchat' | 'main'): void {
+  function showHud(status: QuickChatStatus, owner: 'quickchat' | 'main', panel: Panel | null = null): void {
     if (!pillTurns.connected) return;
     const win = ensureHudWindow();
     if (!win.isVisible()) {
       placeHud(win);
       win.showInactive(); // show without stealing focus
     }
+    hudPanel = owner === 'quickchat' ? panel : null;
     const enteredFinished = hud.notePush(owner, status.phase);
     // Stamp the live accelerator so the pill prompts the real summon key, not Enter.
     win.webContents.send('quickchat:status', { ...status, shortcut: currentShortcut });
@@ -258,43 +416,49 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   function hideHud(): void {
     if (hudWindow && !hudWindow.isDestroyed() && hudWindow.isVisible()) hudWindow.hide();
     hud.noteHidden();
+    hudPanel = null;
   }
 
-  function finishOverlayReset(): void {
-    overlay.releaseThread();
-    overlayResetBarrier.settle();
+  /** Is the pill showing `panel`'s turn? */
+  function hudShows(panel: Panel): boolean {
+    return hud.owner === 'quickchat' && hudPanel === panel;
   }
 
+  function finishOverlayReset(panel: Panel): void {
+    panel.overlay.releaseThread();
+    panel.resetBarrier.settle();
+  }
 
   /**
-   * HUD state machine, driven by the overlay-owned thread's event stream. Only runs
-   * while the overlay is hidden (when it's visible the user is reading, no HUD):
+   * HUD state machine, driven by a panel-owned thread's event stream. Only runs
+   * while that panel is hidden (when it's visible the user is reading, no HUD):
    *   working  -> "Thinking…" / "Searching the web…" / "Using a tool…"
    *   answering -> once the first answer text streams
    *   finished  -> once the turn completes
    */
-  function driveHud(event: { method: string; params: unknown }): void {
+  function driveHud(panel: Panel, event: { method: string; params: unknown }): void {
     const p = (event.params ?? {}) as PillEventParams;
-    if (eventTurnId(p) !== overlayTurnId || !pillTurns.event(event.method, p)) return;
-    const overlayVisible = overlayWindow?.isVisible() ?? false;
+    if (eventTurnId(p) !== panel.turnId || !pillTurns.event(event.method, p)) return;
+    const { overlay } = panel;
+    const visible = onScreen(panel);
     switch (event.method) {
       case 'item/started': {
-        if (overlayVisible) break;
+        if (visible) break;
         const item = (event.params as ItemEventParams)?.item;
         const type = item?.type;
         // Always update — tool calls and teed web searches mid-answer keep the
         // pill live instead of freezing at 'Answering…' after the first token.
         if (type && type !== 'agentMessage')
-          showHud({ phase: 'working', label: activityLabel(type, item?.name, item?.detail) }, 'quickchat');
+          showPanelHud(panel, { phase: 'working', label: activityLabel(type, item?.name, item?.detail) });
         break;
       }
       case 'item/agentMessage/delta': {
-        if (overlayVisible) break;
+        if (visible) break;
         // Deltas arrive per token; only push when the label actually changes
         // (first token, or resuming the answer after a mid-answer tool call).
-        if (!overlay.hudTextSeen || hud.lastPhase !== 'answering') {
+        if (!overlay.hudTextSeen || hud.lastPhase !== 'answering' || hudPanel !== panel) {
           overlay.noteAnswerText();
-          showHud({ phase: 'answering', label: 'Answering…' }, 'quickchat');
+          showPanelHud(panel, { phase: 'answering', label: 'Answering…' });
         }
         break;
       }
@@ -308,15 +472,16 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
               ? 'Request failed'
               : 'Stopped';
         overlay.settleTurn(Date.now());
+        dropApprovals(overlay.threadId);
         // A reset must not release the old thread until this terminal event has
         // been routed. Otherwise its trailing deltas can be mistaken for the next
         // Quick Chat session.
-        if (overlayResetBarrier.pending) {
+        if (panel.resetBarrier.pending) {
           overlay.resetHudText();
-          if (hud.owner === 'quickchat') hideHud();
-          finishOverlayReset();
-        } else if (!overlayVisible) {
-          showHud({ phase: 'finished', label }, 'quickchat');
+          if (hudShows(panel)) hideHud();
+          finishOverlayReset(panel);
+        } else if (!visible) {
+          showHud({ phase: 'finished', label }, 'quickchat', panel);
         }
         break;
       }
@@ -338,9 +503,10 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     if (hud.owner === 'quickchat') return;
     const main = deps.mainWindow();
     const blurred = !!main && !main.isDestroyed() && !main.isFocused();
-    const running = pillTurns.turns.some(t => !overlay.owns(t.threadId));
-    if (running && blurred) {
-      showHud({ phase: 'working', label: 'Working…', reveal: 'main' }, 'main');
+    const running = pillTurns.turns.filter(t => !ownerOf(t.threadId));
+    if (running.length && blurred) {
+      const waiting = running.some(t => awaitingApproval(t.threadId));
+      showHud({ ...(waiting ? WAITING : { phase: 'working', label: 'Working…' }), reveal: 'main' }, 'main');
     } else if (hud.owner === 'main') hideHud();
   }
 
@@ -355,7 +521,8 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     if (method === 'item/started' || method === 'item/agentMessage/delta') {
       syncMainHud();
     } else if (method === 'turn/completed' || method === 'turn/failed' || method === 'turn/aborted' || method === 'process/exit') {
-      if (hud.owner === 'main' && !pillTurns.turns.some(t => !overlay.owns(t.threadId))) {
+      dropApprovals(threadId);
+      if (hud.owner === 'main' && !pillTurns.turns.some(t => !ownerOf(t.threadId))) {
         const label = method === 'turn/completed' ? 'Answer ready' : method === 'turn/aborted' ? 'Stopped' : 'Request failed';
         showHud({ phase: 'finished', label, reveal: 'main' }, 'main');
       }
@@ -363,20 +530,22 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   }
 
   /**
-   * Show the overlay. `reset` true => start a fresh session (compact spotlight bar);
+   * Show a panel. `reset` true => start a fresh session (compact spotlight bar);
    * false => resume the existing session (expanded conversation panel, showing the
-   * answer the user re-summoned to read). The overlay's React state persists across
+   * answer the user re-summoned to read). The panel's React state persists across
    * hide/show, so resuming needs no payload beyond the reset flag.
    */
-  function showQuickChat(reset: boolean, window?: QuickChatWindow): void {
-    const win = ensureOverlayWindow();
+  function showQuickChat(panel: Panel, reset: boolean, window?: QuickChatWindow): void {
+    const win = panelWindow(panel);
     // Resuming puts the answer in front of the user: that's reading it.
-    if (!reset && !overlay.turnRunning) markOverlayThreadRead();
-    hideHud();
+    if (!reset && !panel.overlay.turnRunning) markOverlayThreadRead(panel);
+    // Another panel's running turn keeps its pill.
+    if (hud.owner !== 'quickchat' || hudPanel === panel) hideHud();
     deps.beginSummon();
-    if (peek) {
-      placeOverlayBeside(win, peek.bounds, !reset, reset);
-      followWindow();
+    panel.lastShown = Date.now();
+    if (panel.peek) {
+      placeOverlayBeside(win, panel.peek.bounds, !reset, reset);
+      followWindow(panel);
     } else placeOverlay(win, reset);
     // Surface the panel on whatever Space the user is on and make it the key window
     // so it receives keystrokes (typing, Escape) — without activating Stem, so the
@@ -387,22 +556,22 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   }
 
   /**
-   * Keep the docked panel beside its window while both are on screen: the
-   * window may be dragged or resized with the panel open. Stops itself once
-   * the overlay hides or the window closes.
+   * Keep a docked panel beside its window while both are on screen: the window
+   * may be dragged or resized with the panel open. Stops itself once the panel
+   * hides or the window closes.
    */
-  function followWindow(): void {
-    if (followTimer) return;
-    followTimer = setInterval(() => {
-      const win = overlayWindow;
-      const anchored = peek;
-      if (!win || win.isDestroyed() || !win.isVisible() || !anchored) {
-        stopFollowing();
+  function followWindow(panel: Panel): void {
+    if (panel.followTimer) return;
+    panel.followTimer = setInterval(() => {
+      const win = panel.win;
+      const anchored = panel.peek;
+      if (!live(win) || !win.isVisible() || !anchored) {
+        stopFollowing(panel);
         return;
       }
       void windowBounds(anchored.window.windowId)
         .then((b) => {
-          if (!b || peek !== anchored || !win.isVisible() || win.isDestroyed()) return;
+          if (!b || panel.peek !== anchored || win.isDestroyed() || !win.isVisible()) return;
           const p = anchored.bounds;
           if (b.x === p.x && b.y === p.y && b.width === p.width && b.height === p.height) return;
           anchored.bounds = b;
@@ -413,20 +582,23 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     }, 400);
   }
 
-  function stopFollowing(): void {
-    if (followTimer) clearInterval(followTimer);
-    followTimer = null;
+  function stopFollowing(panel: Panel): void {
+    if (panel.followTimer) clearInterval(panel.followTimer);
+    panel.followTimer = null;
   }
 
   /**
-   * The window shortcut: capture the window the user is in, then summon Quick
-   * Chat beside it with that window as a chip. Pressed again while the overlay
-   * is up, it dismisses like the plain shortcut. The same window again resumes
-   * its conversation (unless it went idle); another window starts a fresh one.
+   * The window shortcut: capture the window the user is in, then summon that
+   * window's own panel beside it, with the window as a chip. Each window keeps
+   * its own panel and conversation, so asking about a second window leaves the
+   * first one's panel open. Pressed while typing in a panel, it dismisses that
+   * panel; pressed over a window whose panel is open, it brings that panel
+   * forward. A known window resumes its conversation (unless it went idle).
    */
   async function askAboutWindow(): Promise<void> {
-    if (overlayWindow && overlayWindow.isVisible()) {
-      dismissQuickChat();
+    const focused = panels().find((p) => onScreen(p) && p.win!.isFocused());
+    if (focused) {
+      dismissQuickChat(focused);
       return;
     }
     if (peeking) return;
@@ -439,31 +611,61 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         return;
       }
       const w = peeked.window;
-      if (deps.peekBrowser && isBrowserApp(w.app, w.bundleId)) {
-        // quiet: a browser that cannot answer is one without browser control.
-        const seen = await deps.peekBrowser(w.app, w.title).catch(() => ({ ready: false, page: null }));
-        w.browserReady = seen.ready;
-        if (seen.page) w.url = seen.page.url;
+      await addBrowserState(w);
+      const known = windowPanels.get(w.windowId);
+      if (known && onScreen(known)) {
+        // Already open beside it: just put the keyboard back in it.
+        known.lastShown = Date.now();
+        deps.beginSummon();
+        presentOverlayWindow(known.win!);
+        known.win!.webContents.send('quickchat:focus', { reset: false });
+        return;
       }
-      const sameWindow = peek?.window.windowId === peeked.window.windowId;
-      const reset = !sameWindow || overlay.shouldStartFresh(Date.now(), newThreadTimeoutMs);
-      if (reset) overlay.clearForFreshSession();
+      const panel = known ?? openWindowPanel(w.windowId);
+      const reset = panel.overlay.shouldStartFresh(Date.now(), newThreadTimeoutMs);
+      if (reset) panel.overlay.clearForFreshSession();
       // The text is read while the user types; the send waits for it (see runQuickChat).
-      const text = reset || !peek
-        ? peeked.window.missing.includes('accessibility')
+      const text = reset || !panel.peek
+        ? w.missing.includes('accessibility')
           ? Promise.resolve(null)
-          : readWindowText(peeked.window.windowId)
-        : peek.text;
-      peek = { window: peeked.window, bounds: peeked.bounds, text };
-      showQuickChat(reset, reset ? peeked.window : undefined);
+          : readWindowText(w.windowId)
+        : panel.peek.text;
+      panel.peek = { window: w, bounds: peeked.bounds, text };
+      showQuickChat(panel, reset, reset ? w : undefined);
     } finally {
       peeking = false;
     }
   }
 
+  /** A browser window: whether browser control can drive it, and its page. */
+  async function addBrowserState(w: QuickChatWindow): Promise<void> {
+    if (!deps.peekBrowser || !isBrowserApp(w.app, w.bundleId)) return;
+    // quiet: a browser that cannot answer is one without browser control.
+    const seen = await deps.peekBrowser(w.app, w.title).catch(() => ({ ready: false, page: null }));
+    w.browserReady = seen.ready;
+    if (seen.page) w.url = seen.page.url;
+  }
+
+  /**
+   * The panel's New: a fresh question about the window it is docked beside
+   * gets a fresh picture and text of it, not the ones from the last summon.
+   * Null when the panel is not a window panel, or the window has closed.
+   */
+  async function repeekPanelWindow(panel: Panel): Promise<QuickChatWindow | null> {
+    const anchored = panel.peek;
+    if (!anchored) return null;
+    const peeked = await peekFrontWindow(anchored.window.windowId);
+    if (!peeked) return null;
+    const w = peeked.window;
+    await addBrowserState(w);
+    const text = w.missing.includes('accessibility') ? Promise.resolve(null) : readWindowText(w.windowId);
+    panel.peek = { window: w, bounds: peeked.bounds, text };
+    return w;
+  }
+
   /** What the model is told about the window a prompt was sent with. */
-  async function windowContextFor(windowId: number | undefined): Promise<WindowContext | undefined> {
-    const anchored = peek;
+  async function windowContextFor(panel: Panel, windowId: number | undefined): Promise<WindowContext | undefined> {
+    const anchored = panel.peek;
     if (windowId === undefined || !anchored || anchored.window.windowId !== windowId) return undefined;
     const { app, bundleId, title, url, browserReady } = anchored.window;
     // A slow app's tree must not hold the question up for long: past this the
@@ -484,48 +686,41 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   }
 
   /**
-   * Quick Chat answers are read in the overlay, never in the main window, so the
-   * overlay's thread has to be stamped read from here or its sidebar row stays
+   * Quick Chat answers are read in the panel, never in the main window, so the
+   * panel's thread has to be stamped read from here or its sidebar row stays
    * bold. Two moments count: re-summoning onto a settled answer, and a turn
-   * settling while the overlay is on screen.
+   * settling while the panel is on screen.
    */
-  function markOverlayThreadRead(): void {
-    const threadId = overlay.threadId;
-    if (!threadId || overlay.handedOff) return;
+  function markOverlayThreadRead(panel: Panel): void {
+    const threadId = panel.overlay.threadId;
+    if (!threadId || panel.overlay.handedOff) return;
     void deps.invoke('inbox:setRead', [[threadId], true]).catch((error) => log('main', 'quick chat mark-read failed', { threadId, error: String(error) }));
   }
 
   /**
-   * Hide the overlay on an explicit dismiss (Escape, or the shortcut pressed again).
-   * The overlay is a non-activating panel, so hiding it does not promote Stem's main
-   * window to the front and the previously-active app keeps focus — we just hide the
-   * panel (no app.hide, which would also hide the main window and the HUD).
+   * Hide a panel on an explicit dismiss (Escape, or the shortcut pressed again).
+   * Panels are non-activating, so hiding one does not promote Stem's main window
+   * to the front and the previously-active app keeps focus — we just hide the
+   * panel (no app.hide, which would also hide the main window, the HUD and every
+   * other panel).
    */
-  function dismissQuickChat(): void {
-    hideOverlayWindow();
+  function dismissQuickChat(panel: Panel): void {
+    stopFollowing(panel);
+    if (onScreen(panel)) panel.win!.hide();
   }
 
-  /** Hide just the overlay window (without app.hide), so the HUD can stay visible. */
-  function hideOverlayWindow(): void {
-    stopFollowing();
-    if (overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible()) overlayWindow.hide();
-  }
-
+  /** The Quick Chat shortcut: summon or dismiss the plain, centred panel. */
   function toggleQuickChat(): void {
-    if (overlayWindow && overlayWindow.isVisible()) {
-      dismissQuickChat();
+    if (onScreen(plain)) {
+      dismissQuickChat(plain);
       return;
     }
     // Decide continue-vs-fresh: no live session, already handed off, or idle past
     // the configured timeout => start a new thread. Clear ownership up front so the
-    // old thread's events stop routing to the (now reset) overlay.
-    const reset = overlay.shouldStartFresh(Date.now(), newThreadTimeoutMs);
-    if (reset) {
-      overlay.clearForFreshSession();
-      // A plain summon starts a plain session: no window chip, centred bar.
-      peek = null;
-    }
-    showQuickChat(reset);
+    // old thread's events stop routing to the (now reset) panel.
+    const reset = plain.overlay.shouldStartFresh(Date.now(), newThreadTimeoutMs);
+    if (reset) plain.overlay.clearForFreshSession();
+    showQuickChat(plain, reset);
   }
 
   /** Grab `accelerator` for `handler`; the accelerator when the OS granted it, else null. */
@@ -560,8 +755,12 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     }
     if (!windowPeekSupported) return;
     currentWindowShortcut = registerAccelerator(accelerator, () => void askAboutWindow());
-    // The helper's launch was most of a first press's wait: start it now.
-    if (currentWindowShortcut) warmWindowPeek();
+    // The helper's launch was most of a first press's wait: start it now, and
+    // have the first window's panel loaded before it is asked for.
+    if (currentWindowShortcut) {
+      warmWindowPeek();
+      ensureSpare();
+    }
   }
 
   /**
@@ -581,44 +780,46 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     };
   }
 
-  async function captureQuickChatHandoff(threadId: string): Promise<{
+  async function captureQuickChatHandoff(panel: Panel, threadId: string): Promise<{
     id: string;
     snapshot: QuickChatHandoff;
   } | null> {
-    const win = overlayWindow;
-    if (!win || win.isDestroyed()) return null;
-    const ticket = overlayHandoffBarrier.begin(threadId);
+    const win = panel.win;
+    if (!live(win)) return null;
+    const ticket = panel.handoffBarrier.begin(threadId);
     if (ticket.fresh) win.webContents.send('quickchat:handoffRequest', { id: ticket.id, threadId });
     const timer = setTimeout(() => {
-      const buffered = overlayHandoffBarrier.cancel(ticket.id);
+      const buffered = panel.handoffBarrier.cancel(ticket.id);
       for (const event of buffered) {
         if (!win.isDestroyed()) win.webContents.send('backend:event', event);
-        driveHud(event);
+        driveHud(panel, event);
       }
     }, 30_000);
     const snapshot = await ticket.promise;
     clearTimeout(timer);
     if (!snapshot) return null;
     // Keep the barrier installed until the caller flips ownership. Otherwise an
-    // event can arrive between this await and chats:open marking the overlay as
+    // event can arrive between this await and chats:open marking the panel as
     // handed off, and be routed back to Quick Chat after its snapshot was taken.
     return { id: ticket.id, snapshot };
   }
 
   /**
-   * Opening the overlay's live thread from the sidebar is an implicit hand-off:
-   * route its events to the main window and drop the overlay/HUD so the two views
+   * Opening a panel's live thread from the sidebar is an implicit hand-off:
+   * route its events to the main window and drop the panel/HUD so the two views
    * don't diverge. Runs before the server reads the thread (chats:open), and its
    * throws are the ones the renderer sees.
    */
   async function threadOpened(threadId: string): Promise<void> {
-    if (!overlay.owns(threadId)) return;
-    const captured = await captureQuickChatHandoff(threadId);
+    const panel = ownerOf(threadId);
+    if (!panel) return;
+    const { overlay } = panel;
+    const captured = await captureQuickChatHandoff(panel, threadId);
     if (!captured) {
       // A simultaneous explicit Open-in-Stem action may already have completed
       // the same transition and cancelled this sidebar request.
       if (!overlay.handedOff) {
-        showQuickChat(false);
+        showQuickChat(panel, false);
         throw new Error('Quick Chat did not return a handoff snapshot. Try Open in Stem again.');
       }
       return;
@@ -627,20 +828,20 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     // before commit stay buffered; events arriving after it route directly
     // to the main renderer.
     const flippedHere = overlay.claimHandoff();
-    const transition = overlayHandoffBarrier.commit(captured.id);
+    const transition = panel.handoffBarrier.commit(captured.id);
     if (!transition) {
       // An explicit handoff may have won while this handler was awaiting the
       // snapshot. Only restore ownership when no other path completed it.
       if (flippedHere) {
         overlay.revertHandoff();
-        showQuickChat(false);
+        showQuickChat(panel, false);
         throw new Error('Quick Chat handoff was interrupted. Try Open in Stem again.');
       }
       return;
     }
     overlay.stopTurn();
-    hideHud();
-    hideOverlayWindow();
+    if (hudShows(panel)) hideHud();
+    dismissQuickChat(panel);
     deps.sendToMain('quickchat:adopt', transition.snapshot);
     for (const bufferedEvent of transition.events) {
       deps.sendToMain('backend:event', bufferedEvent);
@@ -648,30 +849,32 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     }
   }
 
+  /** A backend death took `panel`'s running turn with it: give the input back. */
+  function failPanelTurn(panel: Panel): void {
+    panel.overlay.restore(failQuickChatProcess(Date.now(), panel.overlay.threadId));
+    if (hudShows(panel)) showHud({ phase: 'finished', label: 'Request failed' }, 'quickchat', panel);
+    if (panel.resetBarrier.pending) finishOverlayReset(panel);
+  }
+
   function routeBackendEvent(event: BackendEventEnvelope): boolean {
     const threadId = (event.params as { threadId?: string } | undefined)?.threadId;
-    // The overlay owns its live thread until hand-off: route its events to the
-    // overlay window (which renders the conversation) and the status HUD, NOT the
-    // main window — otherwise the main window would build a phantom user-less slice.
-    const overlayOwned = overlay.owns(threadId);
-    const handoffBuffered = !!threadId && overlayHandoffBarrier.buffer(threadId, event);
-    if (handoffBuffered) {
-      // captureQuickChatHandoff replays these immediately after the atomic snapshot.
-      return true;
-    }
-    if (overlayOwned) {
-      // The overlay's own worker died mid-turn (attributed process/exit routes
+    // captureQuickChatHandoff replays buffered events immediately after the atomic snapshot.
+    if (threadId && panels().some((p) => p.handoffBarrier.buffer(threadId, event))) return true;
+    // A panel owns its live thread until hand-off: route its events to that
+    // panel (which renders the conversation) and the status HUD, NOT the main
+    // window — otherwise the main window would build a phantom user-less slice.
+    const owner = ownerOf(threadId);
+    if (owner) {
+      // The panel's own worker died mid-turn (attributed process/exit routes
       // with the dead turn's threadId): restore the input exactly as an
       // unattributed backend death always has.
-      if (event.method === 'process/exit' && (overlay.turnRunning || overlayResetBarrier.pending) &&
+      if (event.method === 'process/exit' && (owner.overlay.turnRunning || owner.resetBarrier.pending) &&
           pillTurns.event(event.method, (event.params ?? {}) as PillEventParams)) {
-        overlay.restore(failQuickChatProcess(Date.now(), overlay.threadId));
-        if (hud.owner === 'quickchat') showHud({ phase: 'finished', label: 'Request failed' }, 'quickchat');
-        if (overlayResetBarrier.pending) finishOverlayReset();
+        failPanelTurn(owner);
       }
-      sendToOverlay('backend:event', event);
-      driveHud(event);
-      if (event.method === 'turn/completed' && overlayWindow?.isVisible()) markOverlayThreadRead();
+      sendTo(owner, 'backend:event', event);
+      driveHud(owner, event);
+      if (event.method === 'turn/completed' && onScreen(owner)) markOverlayThreadRead(owner);
       return true;
     }
     if (!threadId) {
@@ -682,26 +885,27 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
       const exitParams = event.params as { threadId?: string | null } | undefined;
       if (event.method === 'process/exit' && exitParams && 'threadId' in exitParams) {
         deps.sendToMain('backend:event', event);
-        sendToOverlay('backend:event', event);
+        for (const panel of panels()) sendTo(panel, 'backend:event', event);
         return false;
       }
-      // Process-level events (e.g. process/exit) carry no threadId — let both
-      // windows clear their run state, and clear the follow-me pill so a backend
+      // Process-level events (e.g. process/exit) carry no threadId — let every
+      // window clear its run state, and clear the follow-me pill so a backend
       // crash never leaves a stuck "Working…" pill.
-      const abandonedHandoffEvents = overlayHandoffBarrier.cancelCurrent();
-      for (const bufferedEvent of abandonedHandoffEvents) {
-        sendToOverlay('backend:event', bufferedEvent);
-        driveHud(bufferedEvent);
+      for (const panel of panels()) {
+        for (const bufferedEvent of panel.handoffBarrier.cancelCurrent()) {
+          sendTo(panel, 'backend:event', bufferedEvent);
+          driveHud(panel, bufferedEvent);
+        }
       }
       deps.sendToMain('backend:event', event);
-      sendToOverlay('backend:event', event);
-      if (event.method === 'process/exit') pillTurns.event(event.method, (event.params ?? {}) as PillEventParams);
-      if (event.method === 'process/exit' && (overlay.turnRunning || overlayResetBarrier.pending)) {
-        overlay.restore(failQuickChatProcess(Date.now(), overlay.threadId));
-        if (hud.owner === 'quickchat') showHud({ phase: 'finished', label: 'Request failed' }, 'quickchat');
-        if (overlayResetBarrier.pending) finishOverlayReset();
+      for (const panel of panels()) sendTo(panel, 'backend:event', event);
+      if (event.method === 'process/exit') {
+        pillTurns.event(event.method, (event.params ?? {}) as PillEventParams);
+        for (const panel of panels()) {
+          if (panel.overlay.turnRunning || panel.resetBarrier.pending) failPanelTurn(panel);
+        }
+        if (hud.owner === 'main') hideHud();
       }
-      if (event.method === 'process/exit' && hud.owner === 'main') hideHud();
       return false;
     }
     deps.sendToMain('backend:event', event);
@@ -710,29 +914,30 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
   }
 
   /**
-   * Run a prompt in the overlay's own thread. For a fresh session we pre-create
+   * Run a prompt in the panel's own thread. For a fresh session we pre-create
    * the thread (so its events route correctly from the very first event), then
-   * hide the overlay and raise the HUD — the disappear→HUD half of the cycle.
+   * hide the plain panel and raise the HUD — the disappear→HUD half of the cycle.
    */
-  async function runQuickChat(prompt: QuickChatPrompt): Promise<StartTurnResult> {
+  async function runQuickChat(panel: Panel, prompt: QuickChatPrompt): Promise<StartTurnResult> {
+    const { overlay } = panel;
     // Start the disappear→HUD half of the cycle immediately — before the (async)
-    // thread creation — so the overlay never flashes the half-laid-out panel.
+    // thread creation — so the panel never flashes the half-laid-out panel.
     const turnId = prompt.turnId || randomUUID();
-    overlayTurnId = turnId;
+    panel.turnId = turnId;
     overlay.beginTurn(Date.now());
-    if (peek && overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible()) {
+    if (panel.peek && onScreen(panel)) {
       // Docked beside a window: the answer is read right there, next to what
       // it is about, so the panel grows in place instead of giving way to the
-      // pill. (driveHud shows no pill while the overlay is visible.)
-      placeOverlayBeside(overlayWindow, peek.bounds, true, false);
+      // pill. (driveHud shows no pill while the panel is visible.)
+      placeOverlayBeside(panel.win!, panel.peek.bounds, true, false);
     } else {
-      // Hide just the overlay (NOT app.hide — that would also hide the HUD we're
+      // Hide just the panel (NOT app.hide — that would also hide the HUD we're
       // about to show, and re-showing the HUD would reactivate the app and surface
-      // the main window). The overlay is a non-activating panel, so hiding it does
-      // not promote the main window. The HUD is non-focusable, so it never steals
+      // the main window). The panel is non-activating, so hiding it does not
+      // promote the main window. The HUD is non-focusable, so it never steals
       // focus from whatever app the user is in.
-      hideOverlayWindow();
-      showHud({ phase: 'working', label: 'Working…' }, 'quickchat');
+      dismissQuickChat(panel);
+      showHud({ phase: 'working', label: 'Working…' }, 'quickchat', panel);
     }
 
     try {
@@ -751,7 +956,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         });
       }
 
-      const windowContext = await windowContextFor(prompt.windowId);
+      const windowContext = await windowContextFor(panel, prompt.windowId);
       // `surface` is the whole of what makes this a Quick Chat turn: the server
       // resolves the Quick Chat web-search toggle and the main+quickChat
       // instruction composition from it (see backend:startTurn).
@@ -789,14 +994,15 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
       // there is no answer to announce: the user stopped it, so just stand down.
       if (result.handled) {
         overlay.stopTurn();
-        if (result.canceled) hideHud();
-        else showHud({ phase: 'finished', label: 'Answer ready' }, 'quickchat');
+        if (result.canceled) {
+          if (hudShows(panel)) hideHud();
+        } else if (!onScreen(panel)) showHud({ phase: 'finished', label: 'Answer ready' }, 'quickchat', panel);
       }
       return result;
     } catch (e) {
       overlay.settleTurn(Date.now());
-      hideHud();
-      if (overlayResetBarrier.pending) finishOverlayReset();
+      if (hudShows(panel)) hideHud();
+      if (panel.resetBarrier.pending) finishOverlayReset(panel);
       if (overlay.handedOff && overlay.threadId) {
         deps.sendToMain('backend:event', {
           method: 'turn/failed',
@@ -808,7 +1014,7 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
           receivedAt: new Date().toISOString()
         } satisfies BackendEventEnvelope);
       } else {
-        showQuickChat(false);
+        showQuickChat(panel, false);
       }
       throw e;
     }
@@ -818,19 +1024,28 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
     submitHudTurn(input) { pillTurns.submit(input); },
     acceptHudTurn(turnId) { pillTurns.accepted(turnId); },
     abandonHudTurn(turnId) { pillTurns.abandon(turnId); syncMainHud(); },
-    disconnectHud() { pillTurns.disconnect(); hideHud(); },
+    disconnectHud() {
+      pillTurns.disconnect();
+      approvals.clear(); // The reconnect replays every card still open.
+      hideHud();
+    },
     reconcileHud(deviceId, turns) {
       pillTurns.reconcile(deviceId, turns);
-      const runningOverlay = pillTurns.turns.some(t => t.turnId === overlayTurnId && overlay.owns(t.threadId));
-      if (overlay.turnRunning && !runningOverlay) {
-        overlay.settleTurn(Date.now());
-        if (overlayResetBarrier.pending) finishOverlayReset();
-      }
       hideHud(); // Snapshot corrections are silent; only live endings chime.
-      if (runningOverlay && !overlayWindow?.isVisible()) {
-        overlay.beginTurn(Date.now());
-        showHud({ phase: 'working', label: 'Working…' }, 'quickchat');
-      } else syncMainHud();
+      let shown = false;
+      for (const panel of panels()) {
+        const running = pillTurns.turns.some(t => t.turnId === panel.turnId && panel.overlay.owns(t.threadId));
+        if (panel.overlay.turnRunning && !running) {
+          panel.overlay.settleTurn(Date.now());
+          if (panel.resetBarrier.pending) finishOverlayReset(panel);
+        }
+        if (running && !onScreen(panel)) {
+          panel.overlay.beginTurn(Date.now());
+          if (!shown) showPanelHud(panel, { phase: 'working', label: 'Working…' });
+          shown = true;
+        }
+      }
+      if (!shown) syncMainHud();
     },
     start(settings) {
       // Seed the all-Spaces flag before creating the overlay so it's applied once,
@@ -839,49 +1054,52 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
       newThreadTimeoutMs = settings.newThreadTimeoutMs;
       followAcrossSpaces = settings.followAcrossSpaces;
       finishSound = settings.finishSound;
-      // Pre-create both windows (hidden) so the shortcut summons instantly, and
-      // bind the global accelerator from the saved settings.
-      ensureOverlayWindow();
+      // Pre-create the windows (hidden) so the shortcut summons instantly, and
+      // bind the global accelerators from the saved settings.
+      panelWindow(plain);
       ensureHudWindow();
       applyQuickChatShortcut(settings.shortcut);
       applyWindowShortcut(settings.windowShortcut);
     },
 
     stop() {
-      stopFollowing();
+      for (const panel of panels()) stopFollowing(panel);
       stopWindowPeek();
     },
 
     registerIpc() {
       ipcMain.on('quickchat:handoffSnapshot', (event, id: string, payload: QuickChatHandoff) => {
-        const win = overlayWindow;
-        if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
-        overlayHandoffBarrier.supply(id, payload);
+        const panel = panels().find((p) => live(p.win) && event.sender === p.win.webContents);
+        panel?.handoffBarrier.supply(id, payload);
       });
 
       handleLocal('quickchat:shortcutStatus', () => quickChatShortcutStatus());
-      handleLocal('quickchat:run', (_e, prompt: QuickChatPrompt) => runQuickChat(prompt));
+      handleLocalFrom('quickchat:run', (sender, prompt: QuickChatPrompt) => runQuickChat(panelFor(sender), prompt));
 
-      // Forget the current overlay thread so the next prompt opens a fresh one.
-      handleLocal('quickchat:newThread', () => {
-        overlay.prepareManualReset();
-        hideHud();
-        if (overlay.turnRunning) {
-          return overlayResetBarrier.wait();
+      // Forget the calling panel's thread so its next prompt opens a fresh one.
+      // A window panel also re-captures its window: the reply is the fresh chip.
+      handleLocalFrom('quickchat:newThread', async (sender) => {
+        const panel = panelFor(sender);
+        panel.overlay.prepareManualReset();
+        if (hudShows(panel)) hideHud();
+        if (panel.overlay.turnRunning) {
+          await panel.resetBarrier.wait();
         } else {
-          finishOverlayReset();
+          finishOverlayReset(panel);
         }
+        return repeekPanelWindow(panel);
       });
 
       // Hand the conversation off to the main window: route future events there,
       // reveal the main window, and have it adopt the thread as the active chat.
-      handleLocal('quickchat:handoff', (_e, payload: QuickChatHandoff) => {
-        const bufferedEvents = overlayHandoffBarrier.cancelCurrent();
-        overlay.claimHandoff();
-        overlay.stopTurn();
-        if (overlayResetBarrier.pending) finishOverlayReset();
-        hideHud();
-        hideOverlayWindow();
+      handleLocalFrom('quickchat:handoff', (sender, payload: QuickChatHandoff) => {
+        const panel = panelFor(sender);
+        const bufferedEvents = panel.handoffBarrier.cancelCurrent();
+        panel.overlay.claimHandoff();
+        panel.overlay.stopTurn();
+        if (panel.resetBarrier.pending) finishOverlayReset(panel);
+        if (hudShows(panel)) hideHud();
+        dismissQuickChat(panel);
         deps.revealMainWindow();
         deps.sendToMain('quickchat:adopt', payload);
         for (const bufferedEvent of bufferedEvents) {
@@ -890,17 +1108,20 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
         }
       });
 
-      // Re-summon the overlay (HUD click). Same path as the shortcut.
+      // Re-summon the panel the pill speaks for (HUD click); the plain one by default.
       handleLocal('quickchat:reveal', () => {
-        if (!overlayWindow?.isVisible()) toggleQuickChat();
+        const panel = hudPanel && hudPanel !== plain && live(hudPanel.win) ? hudPanel : null;
+        if (panel) {
+          if (!onScreen(panel)) showQuickChat(panel, false);
+        } else if (!onScreen(plain)) toggleQuickChat();
       });
 
       // Raise the main window (follow-me pill click). Returning focus to the main
       // window fires the 'focus' handler, which hides the pill.
       handleLocal('main:reveal', () => deps.revealMainWindow());
 
-      handleLocal('quickchat:hide', () => {
-        dismissQuickChat();
+      handleLocalFrom('quickchat:hide', (sender) => {
+        dismissQuickChat(panelFor(sender));
       });
 
       // The window chip's "Open Settings": the Privacy pane for the missing grant.
@@ -910,22 +1131,23 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
       });
 
       // The window chip's Connect / Set up: the work happens in the main window's panel.
-      handleLocal('quickchat:openManage', (_e, tab: ManageTabId, raw?: ManageIntent | null) => {
+      handleLocalFrom('quickchat:openManage', (sender, tab: ManageTabId, raw?: ManageIntent | null) => {
         const intent: ManageIntent | null =
           raw?.kind === 'mcp-connect' && typeof raw.entryId === 'string'
             ? { kind: 'mcp-connect', entryId: raw.entryId.slice(0, 100) }
             : raw?.kind === 'browser-control'
               ? { kind: 'browser-control' }
               : null;
-        dismissQuickChat();
+        dismissQuickChat(panelFor(sender));
         deps.revealMainWindow();
         deps.sendToMain('menu:command', { kind: 'manage-tab', tab, ...(intent ? { intent } : {}) } satisfies MenuCommand);
       });
 
       // The panel emptied while on screen (New thread, deleted thread): drop back
       // to the compact bar instead of leaving a tall empty card.
-      handleLocal('quickchat:compact', (_e, chip?: boolean) => {
-        if (overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible()) compactOverlay(overlayWindow, chip === true);
+      handleLocalFrom('quickchat:compact', (sender, chip?: boolean) => {
+        const panel = panelFor(sender);
+        if (onScreen(panel)) compactOverlay(panel.win!, chip === true);
       });
     },
 
@@ -933,14 +1155,14 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
 
     askAboutWindow: () => void askAboutWindow(),
 
-    overlayVisible: () => overlayWindow?.isVisible() ?? false,
+    overlayVisible: () => panels().some(onScreen),
 
     applySettings(patch, next) {
       if ('shortcut' in patch) applyQuickChatShortcut(next.shortcut);
       if ('windowShortcut' in patch) applyWindowShortcut(next.windowShortcut);
       if ('showOnAllDisplays' in patch) {
         overlayOnAllDisplays = next.showOnAllDisplays;
-        applyOverlayWorkspaceVisibility();
+        for (const win of overlayWindows()) setOverlayWorkspaceVisibility(win, overlayOnAllDisplays);
       }
       if ('newThreadTimeoutMs' in patch) newThreadTimeoutMs = next.newThreadTimeoutMs;
       if ('followAcrossSpaces' in patch) {
@@ -952,16 +1174,27 @@ export function createQuickChat(deps: QuickChatDeps): QuickChatSurface {
 
     shortcutStatus: quickChatShortcutStatus,
 
-    sendToOverlay,
+    sendToOverlay(channel, payload) {
+      // Every approval ask and answer funnels through here (live and replayed).
+      if (APPROVAL_REQUESTS.has(channel) || APPROVAL_RESOLUTIONS.has(channel)) noteApproval(channel, payload);
+      if (APPROVAL_REQUESTS.has(channel)) {
+        // One card, in the panel whose conversation asked — or the plain panel,
+        // whose dialog has always carried asks from elsewhere.
+        sendTo(ownerOf((payload as { threadId?: string } | undefined)?.threadId) ?? plain, channel, payload);
+        return;
+      }
+      for (const win of overlayWindows()) win.webContents.send(channel, payload);
+    },
 
     sendToHud(channel, payload) {
       if (hudWindow && !hudWindow.isDestroyed()) hudWindow.webContents.send(channel, payload);
     },
 
     revealIfOwns(threadId) {
-      // Quick Chat hides itself while a turn runs. Bring the originating surface
+      // A panel may be hidden while its turn runs. Bring the originating panel
       // back so mounting a card actually makes the confirmation visible.
-      if (threadId && overlay.owns(threadId)) showQuickChat(false);
+      const panel = threadId ? ownerOf(threadId) : undefined;
+      if (panel && !onScreen(panel)) showQuickChat(panel, false);
     },
 
     routeBackendEvent,

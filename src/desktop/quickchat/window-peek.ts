@@ -64,12 +64,14 @@ function asRect(value: unknown): Rect | null {
  * The window the person was in when they pressed the shortcut, with one
  * picture of it. Null when there is no such window (or this is not a Mac);
  * a missing permission comes back as `missing` with whatever could be read.
+ * With `windowId`, that window instead (the panel's New takes a fresh
+ * picture of the window it is docked beside); null once it has closed.
  */
-export async function peekFrontWindow(): Promise<PeekedWindow | null> {
+export async function peekFrontWindow(windowId?: number): Promise<PeekedWindow | null> {
   if (!windowPeekSupported) return null;
   let reply;
   try {
-    reply = await (await ensureHelper()).call('peek-window', {}, 10_000);
+    reply = await (await ensureHelper()).call('peek-window', windowId === undefined ? {} : { windowId }, 10_000);
   } catch (error) {
     log('quickchat', 'window peek could not start the helper', { error: String(error) });
     return null;

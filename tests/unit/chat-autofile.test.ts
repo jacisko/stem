@@ -293,6 +293,8 @@ describe('autoFileSweep', () => {
     expect(s.prompt()).toContain('- Work / Cloudfarms\n    What belongs here: The farm app\n    · Barn API outage');
     expect(s.prompt()).toContain('- Work (no chats in it yet)');
     expect(s.prompt()).toContain('Cloudfarms sync job');
+    // A folder described as the catch-all is allowed to beat NONE.
+    expect(s.prompt()).toContain('fit nowhere else is the catch-all');
     // A second sweep has nothing left to ask about.
     await autoFileSweep(s.deps, { nowMs: NOW });
     expect(s.complete).toHaveBeenCalledTimes(1);

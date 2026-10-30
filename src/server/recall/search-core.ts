@@ -568,7 +568,7 @@ export async function hybridSearchMessages(
  * tier (rankFactsLexically: recency-blended, trigram-backed), this is the plain
  * hybrid leg used by the MCP search_facts tool.
  */
-export function ftsSearchFacts(db: DatabaseSync, rawQuery: string, limit = FTS_CANDIDATES): CoreFactHit[] {
+export function ftsSearchFacts(db: DatabaseSync, rawQuery: string, limit = FTS_CANDIDATES, contact: string | null = null): CoreFactHit[] {
   const match = buildMatchQuery(rawQuery);
   if (!match) return [];
   try {
@@ -577,17 +577,24 @@ export function ftsSearchFacts(db: DatabaseSync, rawQuery: string, limit = FTS_C
         `SELECT f.id AS id, f.text AS text, bm25(facts_fts) AS score
          FROM facts_fts
          JOIN facts f ON f.id = facts_fts.rowid
-         WHERE facts_fts MATCH ? AND f.status = 'active'
+         WHERE facts_fts MATCH ? AND f.status = 'active' AND ${CONTACT_SCOPE}
          ORDER BY score
          LIMIT ?`
       )
-      .all(match, limit) as Array<{ id: number; text: string; score: number }>;
+      .all(match, contactScopeArg(contact), limit) as Array<{ id: number; text: string; score: number }>;
     return rows.filter((r) => r.score <= FTS_SCORE_CEILING);
   } catch (e) {
     report('recall.facts', 'returned no fact hits from the FTS leg', e);
     return [];
   }
 }
+
+/**
+ * Facts learned from mail with another person (source `contact:<address>`)
+ * answer only in a turn with that same person (store.getInjectableFacts).
+ */
+const CONTACT_SCOPE = `(f.source NOT LIKE 'contact:%' OR f.source = ?)`;
+const contactScopeArg = (contact: string | null | undefined): string => (contact ? `contact:${contact}` : '');
 
 /**
  * The semantic floor for explicit fact search. Matches the injection path's
@@ -608,7 +615,8 @@ export function semanticSearchFactsCore(
   qVec: Float32Array,
   model: string,
   limit: number,
-  minCosine = cosineFloorsFor(model).factSearch
+  minCosine = cosineFloorsFor(model).factSearch,
+  contact: string | null = null
 ): CoreFactHit[] {
   const qMag = Math.sqrt(qVec.reduce((s, v) => s + v * v, 0));
   if (qMag === 0 || limit <= 0) return [];
@@ -618,9 +626,9 @@ export function semanticSearchFactsCore(
       .prepare(
         `SELECT v.fact_id AS id, v.vec AS vec, f.text AS text
          FROM fact_vectors v JOIN facts f ON f.id = v.fact_id
-         WHERE v.model = ? AND f.status = 'active'`
+         WHERE v.model = ? AND f.status = 'active' AND ${CONTACT_SCOPE}`
       )
-      .iterate(model) as Iterable<Record<string, unknown>>;
+      .iterate(model, contactScopeArg(contact)) as Iterable<Record<string, unknown>>;
     for (const row of rows) {
       const vec = bytesToFloat32(row.vec as Uint8Array);
       if (vec.length !== qVec.length) continue;
@@ -647,15 +655,15 @@ export function semanticSearchFactsCore(
 export async function hybridSearchFacts(
   db: DatabaseSync,
   rawQuery: string,
-  opts: { limit?: number; embedQuery?: EmbedQueryFn } = {}
+  opts: { limit?: number; embedQuery?: EmbedQueryFn; contact?: string | null } = {}
 ): Promise<CoreFactHit[]> {
   const limit = opts.limit ?? 10;
-  const fts = ftsSearchFacts(db, rawQuery, FTS_CANDIDATES);
+  const fts = ftsSearchFacts(db, rawQuery, FTS_CANDIDATES, opts.contact ?? null);
   let sem: CoreFactHit[] = [];
   if (opts.embedQuery) {
     try {
       const qe = await opts.embedQuery();
-      if (qe) sem = semanticSearchFactsCore(db, qe.vec, qe.model, SEMANTIC_CANDIDATES);
+      if (qe) sem = semanticSearchFactsCore(db, qe.vec, qe.model, SEMANTIC_CANDIDATES, undefined, opts.contact ?? null);
     } catch (e) {
       // Semantic leg optional — but search_facts without it is a different tool.
       report('recall.facts', 'ranked facts on FTS alone', e);

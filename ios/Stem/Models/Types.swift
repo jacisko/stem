@@ -65,6 +65,9 @@ struct MessageAttachment: Codable, Hashable {
     var mime: String?
     var dataUrl: String?
     var imageId: String?
+    /// Mail with another person: the file kept on the server (GET /files/stem-mailfile:<id>).
+    var fileId: String?
+    var size: Double?
 }
 
 struct GeneratedImageRef: Codable, Hashable {
@@ -198,6 +201,12 @@ struct ServerSettings: Decodable {
     var webSearch: WebSearch
     var defaults: Defaults?
     var customInstructions: Instructions?
+    struct ChatFeatures: Decodable {
+        struct Allow: Decodable { var allow: Bool }
+        var voice: Allow?
+    }
+    /// Absent on an older server, which has no voice chat.
+    var chatFeatures: ChatFeatures?
 }
 
 // MARK: Personas
@@ -222,8 +231,10 @@ struct MailConversation: Decodable, Hashable, Identifiable {
     var subject: String
     var participants: [String]
     var `private`: Bool?
-    /// Inter-Stem: a conversation with another person (only presence matters here).
-    var external: JSONValue?
+    /// Inter-Stem: a conversation with another person, by their email address.
+    var external: MailExternalThread?
+    /// Where a conversation with another person stands (goal, agreed, open, next).
+    var collab: MailCollab?
     /// Owned by a server feature ("memory-check") instead of a persona.
     var owner: String?
     var status: String
@@ -258,12 +269,93 @@ struct MailItem: Decodable, Hashable, Identifiable {
     var agentReplies: [String]?
     /// A parked run's Allow/Deny (the safety check would not run a command without the user).
     var approval: MailApproval?
+    /// Inter-Stem: held from agents (inbound) or the send's progress (outbound).
+    var external: MailItemExternal?
+}
+
+struct MailCollab: Decodable, Hashable {
+    var goal: String
+    var agreed: [String]
+    var open: [String]
+    var next: String?
+}
+
+/// The other side of a conversation with another person.
+struct MailExternalThread: Decodable, Hashable {
+    var address: String
+    var thread: String
+    var `self`: String
+}
+
+/// Port of MailExternal (src/shared/types.ts).
+struct MailItemExternal: Decodable, Hashable {
+    var held: Bool?
+    var keyChanged: Bool?
+    /// queued | sent | delivered | expired | failed | unreachable | key-changed | waiting | joined
+    var status: String?
+    var error: String?
+    var unsupported: Bool?
+
+    var statusLabel: String? {
+        switch status {
+        case "queued": return "Sending…"
+        case "sent": return "Sent"
+        case "delivered": return "Delivered"
+        case "expired": return "Not collected in 7 days"
+        case "failed": return "Not sent"
+        case "unreachable": return "Not sent — they never joined"
+        case "key-changed": return "Waiting — their key changed"
+        case "waiting": return "Waiting for them to join Stem"
+        case "joined": return "Ready to send"
+        default: return nil
+        }
+    }
+
+    /// The user may send this one (again): it never went out, or it waited for them to join.
+    var resendable: Bool { ["joined", "failed", "expired", "unreachable"].contains(status ?? "") }
+}
+
+// MARK: Inter-Stem
+
+struct InterStemContact: Decodable, Hashable, Identifiable {
+    var address: String
+    /// request | accepted | blocked
+    var state: String
+    var keyFp: String
+    var verifiedByUser: Bool?
+    var keyChanged: Bool?
+    var name: String?
+    var autoDraft: Bool?
+    var draftPersona: String?
+    var id: String { address }
+}
+
+struct InterStemAddress: Decodable, Hashable {
+    var address: String
+    /// pending | verified
+    var state: String
+}
+
+struct InterStemStatus: Decodable {
+    var addresses: [InterStemAddress]
+    var contacts: [InterStemContact]
+    var connected: Bool
+}
+
+/// interstem:lookup — reachable | unreachable | self | blocked | refused
+struct InterStemReach: Decodable, Equatable {
+    var state: String
+    var reason: String?
 }
 
 struct MailApproval: Decodable, Hashable {
     var id: String
+    /// exec | harness | send (a persona's draft to another person, waiting for the user to send it)
     var kind: String
+    /// exec/harness: the command. send: the draft text.
     var command: String
+    /// send only: the address the draft goes to.
+    var to: String?
     var cwd: String?
     var deviceLabel: String?
     var reason: String?

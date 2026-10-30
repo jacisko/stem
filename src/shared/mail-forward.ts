@@ -117,12 +117,15 @@ export function forwardCompose(input: {
   quote: string;
   attachments?: TurnAttachment[];
   private?: boolean;
+  /** The forwarded item: the server carries another person's mark from it. */
+  forwardOf?: string;
 }): MailComposeInput {
   return {
     to: input.to,
     subject: input.subject,
     body: forwardBody(input.note, input.quote),
     ...(input.private ? { private: true } : {}),
+    ...(input.forwardOf ? { forwardOf: input.forwardOf } : {}),
     ...(input.attachments?.length ? { attachments: input.attachments } : {})
   };
 }

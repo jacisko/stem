@@ -6,7 +6,7 @@ import { cosineFloorsFor } from './embed-scale';
 import { getEmbeddingsClient } from './retrieval';
 import { cosineSim } from './vector';
 import type { LlmClient } from './llm';
-import { recallStore, type ConsolidationOps, type ConsolidationResult, type Fact } from './store';
+import { isContactFact, recallStore, type ConsolidationOps, type ConsolidationResult, type Fact } from './store';
 const {
   applyConsolidation, getAllFacts, getConsolidateChunkSize, getFactsGeneration, getFactsMissingVector, getFactVectors,
   getMeta, getNewestEvidenceTsByFact, getTidyThreshold, setMeta, upsertFactVectorForSnapshot
@@ -77,7 +77,7 @@ function isProtected(f: Fact): boolean {
 
 /** The facts tidy-up is responsible for: active, and not condensed from a folder document. */
 function tidyPool(facts: Fact[]): Fact[] {
-  return facts.filter((f) => f.status === 'active' && !f.source.startsWith('folder:'));
+  return facts.filter((f) => f.status === 'active' && !f.source.startsWith('folder:') && !isContactFact(f));
 }
 
 /**
@@ -110,7 +110,7 @@ export type TidyScope = 'recent' | 'full';
 export function fullTidyDue(): boolean {
   const threshold = getTidyThreshold();
   if (threshold === 0) return false;
-  const all = getAllFacts().filter((f) => !f.source.startsWith('folder:'));
+  const all = getAllFacts().filter((f) => !f.source.startsWith('folder:') && !isContactFact(f));
   const active = all.filter((f) => f.status === 'active').length;
   if (active < MIN_FACTS) return false;
   const last = readWatermark(FULL_TIDY_KEY, getFactsGeneration());

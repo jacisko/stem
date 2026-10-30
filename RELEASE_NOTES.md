@@ -12,6 +12,17 @@ Maintainer notes:
   date, tag.
 -->
 
+## 0.7.5 — Unreleased
+
+### Added
+
+- **Voice chat.** Press the voice button in the chat composer and talk. Stem answers out loud,
+  and you can talk over it to interrupt. Everything you ask goes into the open chat as an ordinary
+  message, so memory, personas and tools work as when you type, and the conversation stays there
+  to read. It runs on your ChatGPT subscription and never uses paid credits: a call won't start,
+  and a running one hangs up, once your plan's limit is reached. Turn it off in Settings →
+  Features.
+
 ## 0.7.1 — 2026-10-23
 
 ### Added

@@ -304,23 +304,29 @@ export class FolderIndexStore {
   // 'all' stamps nothing. Oldest-first ordering matters: the supersede/conflict
   // machinery assumes newer information arrives later, mirroring chat chronology.
 
-  /** Docs awaiting distillation, oldest mtime first. */
-  pendingLearnDocs(limit: number): PendingLearnDoc[] {
+  /**
+   * Docs awaiting distillation, oldest mtime first. `under` limits them to one
+   * subfolder ('memory/'), for a folder that learns only part of itself.
+   */
+  pendingLearnDocs(limit: number, under = ''): PendingLearnDoc[] {
     return this.open()
       .prepare(
         `SELECT id, rel_path AS relPath, title, text, mtime, hash
          FROM docs
-         WHERE learned_hash IS NULL OR learned_hash <> hash
+         WHERE (learned_hash IS NULL OR learned_hash <> hash) AND substr(rel_path, 1, ?) = ?
          ORDER BY mtime ASC, id ASC
          LIMIT ?`
       )
-      .all(limit) as unknown as PendingLearnDoc[];
+      .all(under.length, under, limit) as unknown as PendingLearnDoc[];
   }
 
-  pendingLearnCount(): number {
+  pendingLearnCount(under = ''): number {
     return (this.open()
-      .prepare(`SELECT COUNT(*) AS n FROM docs WHERE learned_hash IS NULL OR learned_hash <> hash`)
-      .get() as { n: number }).n;
+      .prepare(
+        `SELECT COUNT(*) AS n FROM docs
+         WHERE (learned_hash IS NULL OR learned_hash <> hash) AND substr(rel_path, 1, ?) = ?`
+      )
+      .get(under.length, under) as { n: number }).n;
   }
 
   /** Mark docs as distilled at their current content. */

@@ -68,7 +68,9 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
     a.string,
     a.string,
     a.optional(a.nullish(a.string)),
-    a.optional(a.nullish(a.oneOf(['openai-completions', 'anthropic-messages'])))
+    a.optional(a.nullish(a.oneOf(['openai-completions', 'anthropic-messages']))),
+    // A paired computer to probe from; null/absent = from the server.
+    a.optional(a.nullish(a.string))
   ],
   'providers:updateLocal': [a.string, a.object],
   'providers:disconnect': [a.string],
@@ -138,6 +140,9 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   // land (exec-device/router.ts asAnnouncement/asResult).
   'execHost:announce': [a.object],
   'execHost:result': [a.string, a.object],
+  // One batch of a relayed model response (llm-device/router.ts). No device
+  // id: the caller is the device, and the relay checks it owns the request.
+  'llmHost:chunk': [a.object],
   'harnessHost:announce': [a.object],
   'harnessHost:result': [a.string, a.object],
   'harnessHost:event': [a.object],
@@ -224,7 +229,8 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   // Inter-Stem mail (ipc/interstem.ts).
   'mail:composeExternal': [a.object],
   'mail:release': [a.string, a.string],
-  'mail:draftExternal': [a.string, a.string, a.optional(a.nullish(a.string))],
+  'mail:draftExternal': [a.string, a.string, a.optional(a.nullish(a.string)), a.optional(a.nullish(a.boolean))],
+  'mail:resendExternal': [a.string, a.string],
   'share:preview': [a.object, a.optional(a.nullish(a.object))],
   'share:create': [a.object, a.optional(a.nullish(a.object))],
   'share:revoke': [a.string],
@@ -235,6 +241,10 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   'interstem:setUnlisted': [a.boolean],
   'interstem:contact': [a.oneOf(['accept', 'block', 'unblock', 'verify', 'unverify', 'ackKey']), a.string],
   'interstem:invite': [a.string],
+  'interstem:lookup': [a.string],
+  'interstem:contactMemory': [a.string],
+  'interstem:forgetContact': [a.string],
+  'interstem:setContact': [a.string, a.object],
   'mail:setRead': [a.stringArray, a.boolean],
   'mail:setArchived': [a.stringArray, a.boolean],
   'mail:snooze': [a.stringArray, a.nullish(a.number)],
@@ -258,6 +268,8 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   // act on it later — the handler does not read it today, and the contract says
   // it never has to (see ipc/devices.ts).
   'devices:presence': [a.number],
+  'serverUpgrade:status': [a.optional(a.string)],
+  'serverUpgrade:setAuto': [a.boolean],
   'settings:updateQuickChat': [a.object],
   'settings:updateWebSearch': [a.object],
   'settings:updateEscapeAction': [a.oneOf(['off', 'single', 'twoStage'])],
@@ -270,6 +282,8 @@ const IPC_ARGS: Record<string, ArgSpec[]> = {
   'settings:updateExec': [a.object],
   'settings:updateHarness': [a.object],
   'settings:updateChatFeatures': [a.object],
+  // Voice chat: the client's WebRTC SDP offer (server/ipc/voice.ts).
+  'voice:connect': [a.string],
   'exec:resolveApproval': [a.string, a.oneOf(['allowOnce', 'alwaysAllow', 'deny'])],
   // The second string is the harness's own optionId; the service checks it
   // against the card's options rather than any fixed vocabulary.

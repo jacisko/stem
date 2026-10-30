@@ -161,6 +161,9 @@ export interface MessageAttachment {
   dataUrl?: string;
   /** Replayed images only: the id generate_image `references` can name. */
   imageId?: string;
+  /** Mail with another person: the file's bytes, fetched as GET /files/stem-mailfile:<id>. */
+  fileId?: string;
+  size?: number;
 }
 
 export interface ChatMessage {
@@ -331,6 +334,33 @@ export interface LocalProviderSettings {
    * so one left over from another endpoint is inert.
    */
   modelOverrides?: Record<string, ModelOverride>;
+  /**
+   * The paired computer the server runs on, when that is not the machine
+   * hosting stem-server. `baseUrl` is then read ON that computer —
+   * `http://localhost:1234` is its LM Studio — and every request, the model
+   * listing included, travels over that computer's link to Stem
+   * (server/llm-device/). Absent = stem-server reaches `baseUrl` itself.
+   */
+  location?: { deviceId: string };
+}
+
+/** A patch to one local provider; `location: null` moves it back to the server. */
+export type LocalProviderPatch = Omit<Partial<LocalProviderSettings>, 'location'> & {
+  location?: { deviceId: string } | null;
+};
+
+/**
+ * How a local provider's last model check went, as the server recorded it.
+ * `manual` = its model ids were typed by hand, so nothing is ever checked.
+ * `models` is what pi was given, which after a failed check is the list the
+ * last good one found — the reason a dead server can still show models.
+ */
+export interface LocalProviderHealth {
+  state: 'ok' | 'down' | 'manual';
+  error?: string;
+  models: string[];
+  /** Epoch ms of the check. */
+  checkedAt: number;
 }
 
 export type LocalProvidersSettings = {
@@ -844,6 +874,9 @@ export interface SkillSummary {
  */
 export const FILES_CONTEXT_LIMIT = 100;
 
+/** Most files one listing walks before it stops and says so; the Files tab cannot show more usefully anyway. */
+export const FILES_LISTING_CAP = 5_000;
+
 /** One file in the Files folder. `rel` is the path relative to files/ (the id). */
 export interface FileEntry {
   /** Path relative to files/, e.g. `Recipes/cake.pdf`. Unique id for removal. */
@@ -854,6 +887,21 @@ export interface FileEntry {
   dir: string;
   /** Bytes on disk, for display. */
   size: number;
+  /** Last modified, in ms. Absent from servers older than the Files cleanup view. */
+  mtimeMs?: number;
+}
+
+/**
+ * A tool folder inside files/ (a virtualenv, node_modules, a cache) that the
+ * listing names once instead of walking — see server/files/bulky.ts.
+ */
+export interface SkippedFilesDir {
+  /** Path relative to files/, e.g. `qwen-test/.venv`. Removable through removeFile. */
+  rel: string;
+  /** Top-level subfolder it is or lives in (the group it shows under), or '' at the root of files/. */
+  dir: string;
+  /** What it is, for people: "Python environment", "Node packages". */
+  kind: string;
 }
 
 /** The Files folder contents: top-level subfolders (drive the drop bands) + files. */
@@ -863,6 +911,10 @@ export interface FilesListing {
   /** Sorted top-level subfolder names. */
   dirs: string[];
   files: FileEntry[];
+  /** Tool folders left out of `files`. Absent from older servers. */
+  skipped?: SkippedFilesDir[];
+  /** True when the walk stopped at FILES_LISTING_CAP, so `files` is not everything. */
+  truncated?: boolean;
 }
 
 // ---- Connected folders (external folders the assistant reads in place) ----
@@ -908,9 +960,9 @@ export interface ConnectedFolder {
   learnModel?: string;
   /**
    * What the person said the folder is when connecting it (the wizard's kinds).
-   * A label only — it picks the folder's icon and changes no behaviour; the
-   * settings it suggested are stored in their own fields. Absent on folders
-   * connected before it existed.
+   * A label only — it picks the folder's icon and changes no behaviour (the
+   * one exception is 'claude'); the settings it suggested are stored in their
+   * own fields. Absent on folders connected before it existed.
    */
   kind?: ConnectedFolderKind;
   /**
@@ -942,7 +994,13 @@ export interface ConnectedFolder {
   skippedCount?: number;
 }
 
-export type ConnectedFolderKind = 'notes' | 'code' | 'docs' | 'private';
+/**
+ * 'claude' is the "Claude Code" folder (memory + session transcripts from one
+ * machine, converted there). Unlike the others it is set by the connect flow,
+ * never picked for an ordinary folder, and it does change behaviour: memory
+ * files are learned even in 'use' mode (folder-index/learn.ts).
+ */
+export type ConnectedFolderKind = 'notes' | 'code' | 'docs' | 'private' | 'claude';
 
 /**
  * A cheap look inside a folder, for the model that suggests its settings: what
@@ -2136,6 +2194,52 @@ export interface SetupBrowser {
   app: string;
   /** Its extensions page, to type into the address bar. */
   extensionsUrl: string;
+  /** A Snap or Flatpak browser's own copy of the extension, when it cannot read the shared one. */
+  extensionPath?: string;
+}
+
+// ---- Model servers on the user's own devices (LocalProviderSettings.location) ----
+//
+// pi talks HTTP to a loopback relay inside stem-server; the relay hands each
+// request to the device as an addressed control frame, and the device answers
+// with ordered chunk batches over ordinary authenticated RPCs (`llmHost:chunk`).
+// Same rails as the exec and harness paths: off the replay ring, 128-bit
+// single-use request ids. A cancel frame exists because pi aborts streams
+// (the user stops a turn), and an abandoned generation would keep the Mac's
+// GPU busy for nothing.
+
+/** Addressed control frame carrying one HTTP request to the device. */
+export const LLM_REQUEST_FRAME = 'llm-request';
+/** Addressed control frame telling the device the caller hung up. */
+export const LLM_CANCEL_FRAME = 'llm-cancel';
+
+export interface DeviceLlmRequest {
+  requestId: string;
+  /** Absolute URL on the device's side; the device refuses anything off its own network. */
+  url: string;
+  method: 'GET' | 'POST' | 'OPTIONS';
+  headers: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * One batch of a response, `llmHost:chunk`. `seq` orders them (0, 1, 2, …);
+ * the first carries `status` and `headers`, the last `done` or `error`. An
+ * empty batch is a heartbeat while the server is still loading a model.
+ */
+export interface DeviceLlmChunk {
+  requestId: string;
+  seq: number;
+  status?: number;
+  headers?: Record<string, string>;
+  data?: string;
+  done?: true;
+  error?: string;
+}
+
+/** The answer to a chunk: `live: false` = nobody is listening any more, abort. */
+export interface DeviceLlmAck {
+  live: boolean;
 }
 
 // ---- Coding agents on the user's own devices (coding_agent's `device`) ----
@@ -2715,7 +2819,7 @@ export interface FactEvidence {
   /** 'folder_doc' = an indexed connected-folder file (folderId/relPath set).
    *  'assistant_claim_web' = an assistant message from a turn that used web tools,
    *  i.e. the excerpt may restate untrusted public-web content. */
-  origin: 'explicit_user' | 'user_message' | 'assistant_claim' | 'assistant_claim_web' | 'legacy' | 'folder_doc' | 'segment_context';
+  origin: 'explicit_user' | 'user_message' | 'assistant_claim' | 'assistant_claim_web' | 'legacy' | 'folder_doc' | 'segment_context' | 'contact_mail';
   /** Connected-folder id, for 'folder_doc' evidence. */
   folderId?: string | null;
   /** Folder-relative file path, for 'folder_doc' evidence. */
@@ -3139,11 +3243,36 @@ export interface MailExternal {
   held?: boolean;
   /** Inbound: the sender's key differs from the one pinned for them. */
   keyChanged?: boolean;
-  /** Outbound progress. Toward strangers 'sent' is all the relay ever says. */
-  status?: 'queued' | 'sent' | 'delivered' | 'expired' | 'failed' | 'unreachable' | 'key-changed';
+  /**
+   * Outbound progress. Toward strangers 'sent' is all the relay ever says.
+   * 'waiting': they aren't on Stem (or only take mail from people they wrote
+   * to); the mail stays here and Stem looks for them now and then. 'joined':
+   * they can be reached now — the user sends it with one click.
+   * 'unreachable': the wait ran out.
+   */
+  status?: 'queued' | 'sent' | 'delivered' | 'expired' | 'failed' | 'unreachable' | 'key-changed' | 'waiting' | 'joined';
   error?: string;
   /** Inbound mail in a format this Stem doesn't understand. */
   unsupported?: boolean;
+}
+
+/**
+ * Where a conversation with another person stands, written by the memory
+ * model from the mail the user's agents may read (released, and the user's
+ * own). Shown above the thread and on its Inbox row.
+ */
+export interface MailCollab {
+  /** What the two are working out, in a line. */
+  goal: string;
+  /** Settled between them. */
+  agreed: string[];
+  /** Still to decide or do. */
+  open: string[];
+  /** The next step, if one is clear. */
+  next?: string;
+  /** The item it was written from (the newest readable one). */
+  basedOn: string;
+  updatedAt: number;
 }
 
 /** The other side of an inter-Stem conversation. */
@@ -3166,7 +3295,21 @@ export interface InterStemContact {
   /** Their key changed since it was pinned and the user hasn't acknowledged it. */
   keyChanged?: boolean;
   firstSeen: number;
+  /** The name the user gave them (shown beside the address, never instead of it). */
+  name?: string;
+  /**
+   * Their new mail is released to the persona below, which drafts a reply at
+   * once. Only for contacts verified by the user; sending still waits for them.
+   */
+  autoDraft?: boolean;
+  /** The persona that last drafted a reply to them: the default next time. */
+  draftPersona?: string;
 }
+
+/** Whether an address can be mailed, checked before sending (interstem:lookup). */
+export type InterStemReach =
+  | { state: 'reachable' | 'unreachable' | 'self' | 'blocked' }
+  | { state: 'refused'; reason: string };
 
 export interface InterStemAddress {
   address: string;
@@ -3404,6 +3547,15 @@ export interface MailConversation {
    */
   external?: MailExternalThread;
   /**
+   * An internal conversation that carries mail from another person (the
+   * user forwarded it in): every turn in it is external context, the same as
+   * in the conversation with them — side-effect tools gated, nothing captured
+   * as the user's — and what was learned from them is recalled here.
+   */
+  outside?: { address: string };
+  /** Mail with another person: where the collaboration stands (interstem/collab.ts). */
+  collab?: MailCollab;
+  /**
    * 'working' while a delivery is in flight; 'awaiting-user' when the wave is
    * held on the user rather than answered (a paired computer offline, the
    * exchange cap spent) — a persona's answer, explicit or implicit, settles
@@ -3473,6 +3625,12 @@ export interface MailComposeInput {
   attachments?: TurnAttachment[];
   /** Start the conversation private — see MailConversation.private. */
   private?: boolean;
+  /**
+   * A forward: the mail item it carries. When that mail came from (or went
+   * to) another person, the new conversation inherits their mark — see
+   * MailConversation.outside.
+   */
+  forwardOf?: string;
 }
 
 // ---- Chats (backend-backed) + Folders (Stem-owned organization) ----
@@ -3981,6 +4139,9 @@ export interface HarnessSettings {
   agents: Record<string, { command?: string }>;
 }
 
+/** Whether a voice call may start or go on; `reason` is shown to the user. */
+export type VoiceAllowance = { ok: true } | { ok: false; reason: string };
+
 /**
  * Coding agents and computer control in chats that run as NO persona
  * (2026-09-27). Personas keep their pins as the whole story — a persona chat
@@ -4023,6 +4184,13 @@ export interface ChatFeatureSettings {
    * also needs an openai-codex sign-in. Absent (an older server) = on.
    */
   images?: { allow: boolean };
+  /**
+   * Voice chat (the composer's voice button): OpenAI's realtime voice model on
+   * the user's ChatGPT subscription, handing every real question to an
+   * ordinary Stem turn. Needs an openai-codex sign-in. Absent (an older
+   * server) = on.
+   */
+  voice?: { allow: boolean };
 }
 
 /**
@@ -4679,7 +4847,7 @@ export interface QuickChatPrompt {
 }
 
 /** HUD phases for the bottom-left status pill while the overlay is hidden. */
-export type QuickChatStatusPhase = 'working' | 'answering' | 'finished';
+export type QuickChatStatusPhase = 'working' | 'waiting' | 'answering' | 'finished';
 
 /** Main → HUD: the one-line status to display. */
 export interface QuickChatStatus {
@@ -4951,17 +5119,23 @@ export interface StemApi {
    * Enable/disable or repoint a local model server (Ollama / LM Studio). On enable,
    * main probes the server, registers its models with the backend, and restarts it.
    */
-  updateLocalProvider(id: LocalProviderId, patch: Partial<LocalProviderSettings>): Promise<ProviderLoginResult>;
+  updateLocalProvider(id: LocalProviderId, patch: LocalProviderPatch): Promise<ProviderLoginResult>;
   /**
    * Probe a local server's /v1/models without persisting anything. `api` omitted
-   * = auto-detect the flavor from the routes the endpoint exposes.
+   * = auto-detect the flavor from the routes the endpoint exposes. `deviceId`
+   * probes it from that paired computer instead of from the server.
    */
   testLocalProvider(
     id: LocalProviderId,
     baseUrl: string,
     apiKey?: string,
-    api?: LocalProviderApi
+    api?: LocalProviderApi,
+    deviceId?: string | null
   ): Promise<LocalProviderTestResult>;
+  /** How each enabled local provider's last model check went. */
+  localProviderHealth(): Promise<Record<string, LocalProviderHealth>>;
+  /** Check every enabled local provider now (restarting the backend when its list changed). */
+  refreshLocalProviders(): Promise<Record<string, LocalProviderHealth>>;
   /** Remove a provider's credentials (or disable a local provider) and refresh the backend. */
   disconnectProvider(providerId: string): Promise<ProviderLoginResult>;
   /**
@@ -5080,6 +5254,12 @@ export interface StemApi {
    * (remote installs only; the picker already ran). Returns the fresh list.
    */
   addClientFolders(paths: string[]): Promise<ConnectedFolder[]>;
+  /**
+   * The "Claude Code" folder: fill this machine's converted copy of its Claude
+   * Code memory and sessions (desktop/claude-export) and answer the path to
+   * connect and its default name.
+   */
+  prepareClaudeCodeFolder(): Promise<{ path: string; label: string }>;
   /** This machine's per-folder sync phase (see desktop/mirror-host). */
   mirrorLocalState(): Promise<{ folderId: string; clientPath: string; phase: 'idle' | 'syncing' | 'frozen'; lastError?: string }[]>;
   /** The files the owning device's last scan could not mirror, with the reason each. */
@@ -5160,10 +5340,23 @@ export interface StemApi {
   /** `body`: a send draft as the user edited it before sending. */
   resolveMailApproval(itemId: string, decision: 'allow' | 'deny', body?: string): Promise<{ ok: boolean; error?: string }>;
   // Inter-Stem mail (docs/inter-stem-mail-design.md).
-  composeExternalMail(input: { to: string; subject?: string; body: string; self?: string }): Promise<MailListResult>;
+  composeExternalMail(input: { to: string; subject?: string; body: string; self?: string; attachments?: TurnAttachment[] }): Promise<MailListResult>;
   /** Let the user's agents see held mail from another Stem, up to and including this item. */
   releaseMail(conversationId: string, itemId: string): Promise<MailListResult>;
-  draftExternalMail(conversationId: string, personaId: string, instructions?: string): Promise<MailListResult>;
+  /** `release`: let the agents read the held mail first (one click: read it and draft). */
+  draftExternalMail(conversationId: string, personaId: string, instructions?: string, release?: boolean): Promise<MailListResult>;
+  /** Send a person's mail again: one that waited for them to join Stem, or failed. */
+  resendExternalMail(conversationId: string, itemId: string): Promise<MailListResult>;
+  interStemLookup(address: string): Promise<InterStemReach>;
+  /** How many facts Stem learned from mail with them. */
+  interStemContactMemory(address: string): Promise<{ facts: number }>;
+  /** Forget every fact learned from mail with them. */
+  interStemForgetContact(address: string): Promise<{ forgotten: number }>;
+  interStemSetContact(address: string, patch: { name?: string | null; autoDraft?: boolean }): Promise<InterStemStatus>;
+  /** A system notification was clicked: open this mail conversation. */
+  onOpenMailConversation(listener: (conversationId: string) => void): () => void;
+  /** Mail from another person just landed (desktop notification). */
+  onInterStemMail(listener: (mail: { conversationId: string; from: string; name?: string; subject?: string }) => void): () => void;
   interStemStatus(): Promise<InterStemStatus>;
   interStemAddAddress(address: string): Promise<InterStemStatus>;
   interStemVerifyAddress(address: string, code: string): Promise<InterStemStatus>;
@@ -5393,6 +5586,10 @@ export interface StemApi {
   forkThread(threadId: string, turnId: string): Promise<{ threadId: string }>;
   compactChat(threadId: string, instructions?: string): Promise<CompactChatResult>;
   /** The chat's pinboard, in board order. Each mutator answers with the fresh list. */
+  /** Voice chat: answer this WebRTC offer with OpenAI's (server/ipc/voice.ts). Throws with the refusal. */
+  voiceConnect(offerSdp: string): Promise<{ sdp: string }>;
+  /** Voice chat: is a call still allowed (switch, sign-in, plan usage left)? Polled during a call. */
+  voiceCheck(): Promise<VoiceAllowance>;
   listPins(threadId: string): Promise<ChatPin[]>;
   addPin(threadId: string, input: ChatPinInput): Promise<ChatPin[]>;
   updatePin(threadId: string, pinId: string, patch: ChatPinPatch): Promise<ChatPin[]>;
@@ -5552,6 +5749,10 @@ export interface StemApi {
   // Devices: which clients may reach the server, and how a new one is admitted.
   /** Every registered device plus any pairing code still outstanding. */
   listDevices(): Promise<DevicesSnapshot>;
+  serverUpgradeStatus(): Promise<ServerUpgradeStatus>;
+  startServerUpgrade(): Promise<ServerUpgradeStatus>;
+  setServerAutoUpgrade(auto: boolean): Promise<ServerUpgradeStatus>;
+  onServerUpgradeChanged(listener: (status: ServerUpgradeStatus) => void): () => void;
   /** Remove a device's credential and cut any event stream it has open. */
   revokeDevice(id: string): Promise<DevicesSnapshot>;
   /** Mint a one-shot pairing code for a device that will be called `label`. */
@@ -5711,7 +5912,8 @@ export interface StemApi {
    *  overlay + raises the HUD, pre-creating a thread for a fresh session). */
   runQuickChat(prompt: QuickChatPrompt): Promise<StartTurnResult>;
   /** Overlay → main: forget the current overlay thread so the next prompt is fresh. */
-  newQuickChatThread(): Promise<void>;
+  /** Forget the panel's thread; a window panel answers with a fresh capture of its window (null: none, or it closed). */
+  newQuickChatThread(): Promise<QuickChatWindow | null>;
   /** Overlay → main: hand the conversation off to the main window. */
   handoffQuickChat(payload: QuickChatHandoff): Promise<void>;
   /** Overlay: main requests an atomic snapshot before changing event ownership. */
@@ -5780,4 +5982,31 @@ export interface MemoryCheckSummary {
   openProposals: number;
   questions: number;
   openQuestions: number;
+}
+
+/**
+ * Where a server's own upgrade stands, as Settings → Server shows it. The
+ * server knows its version; clients report theirs (serverUpgrade:status), and
+ * the newest one is the target. The upgrade itself is done by the updater
+ * sidecar in docker-compose.yml — see src/server/upgrade.ts.
+ */
+export interface ServerUpgradeStatus {
+  serverVersion: string;
+  /** Newest version any client has reported since this server started, or null. */
+  newestClient: string | null;
+  /**
+   * absent: no updater beside this server (desktop, or a compose file without
+   *   the sidecar) — upgrading is the operator's job.
+   * source: the image was built from source, not pulled from a release; the
+   *   updater stays out of the way so a pull never replaces local work.
+   * ready / working / failed: the updater is there and is idle, busy, or failed
+   *   last time.
+   */
+  updater: 'absent' | 'source' | 'ready' | 'working' | 'failed';
+  /** The version being installed (working) or that failed (failed). */
+  target: string | null;
+  /** What the updater is doing, or why it failed, in its own words. */
+  detail: string | null;
+  /** Whether the server upgrades itself when a newer client shows up. */
+  auto: boolean;
 }

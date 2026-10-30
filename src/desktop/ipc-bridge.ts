@@ -1,4 +1,4 @@
-import { ipcMain, type IpcMainInvokeEvent } from 'electron';
+import { ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import { a, argsProblem, ipcArgSpecs, type ArgSpec, type CallerContext } from '../server/ipc';
 import { log } from '../server/log';
 
@@ -117,7 +117,7 @@ const bound = new Set<string>();
  * applied before `invoke` runs. Rejected calls throw back to the renderer's
  * invoke() and are logged; the handler is never entered.
  */
-function bind(channel: string, specs: ArgSpec[], invoke: (args: unknown[]) => unknown): void {
+function bind(channel: string, specs: ArgSpec[], invoke: (args: unknown[], sender: WebContents) => unknown): void {
   if (bound.has(channel)) return;
   bound.add(channel);
   ipcMain.handle(channel, (event, ...args) => {
@@ -126,7 +126,7 @@ function bind(channel: string, specs: ArgSpec[], invoke: (args: unknown[]) => un
       log('ipc', `rejected ${channel}`, { problem });
       throw new Error(`Rejected IPC call to ${channel}: ${problem}.`);
     }
-    return invoke(args);
+    return invoke(args, event.sender);
   });
 }
 
@@ -147,6 +147,23 @@ export function handleLocal(
 ): void {
   localHandlers.set(channel, handler as (event: CallerContext, ...args: unknown[]) => unknown);
   bind(channel, LOCAL_IPC_ARGS[channel] ?? [], (args) => localHandlers.get(channel)!(undefined, ...args));
+}
+
+/** The same, for handlers that need the calling window (see handleLocalFrom). */
+const localSenderHandlers = new Map<string, (sender: WebContents | undefined, ...args: unknown[]) => unknown>();
+
+/**
+ * handleLocal for a channel whose answer depends on WHICH of our windows asked:
+ * the handler gets the calling window's webContents instead of a caller context.
+ * Quick Chat uses it — every "Ask about this window" panel is its own window
+ * with its own conversation, and `quickchat:run` must run in the caller's.
+ */
+export function handleLocalFrom(
+  channel: string,
+  handler: (sender: WebContents | undefined, ...args: never[]) => unknown
+): void {
+  localSenderHandlers.set(channel, handler as (sender: WebContents | undefined, ...args: unknown[]) => unknown);
+  bind(channel, LOCAL_IPC_ARGS[channel] ?? [], (args, sender) => localSenderHandlers.get(channel)!(sender, ...args));
 }
 
 /**

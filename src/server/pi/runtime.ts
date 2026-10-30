@@ -167,7 +167,7 @@ import { trackGeneration } from './generation-speed';
 import { PiWorker } from './worker';
 import { findImageInEntries, newImageId, parseImagesMarker, stemImageOf } from './image-gen.mjs';
 import { cameFromInput, jsonNeedle } from '../chats/remote-image';
-import { mailPreamble, personaNotesBlock, priorReportsBlock } from '../mail/preamble';
+import { lookupsLine, mailPreamble, personaNotesBlock, priorReportsBlock, type Lookups } from '../mail/preamble';
 import { systemVersion } from '../sys-version';
 import { secretKeyHex } from './secrets';
 import {
@@ -234,11 +234,17 @@ const SCHED_STRIP_RE = /^<!--stem:scheduled at="([^"]*)"-->[\s\S]*?<!--\/stem:sc
  * here — the same block a mail delivery renders — so what the persona learned
  * on one schedule is in front of it on the next.
  */
-function scheduledPreamble(at: string, notes?: { id: string; title: string }[], prior?: ScheduledRunReport[]): string {
+function scheduledPreamble(
+  at: string,
+  notes?: { id: string; title: string }[],
+  prior?: ScheduledRunReport[],
+  lookups?: Lookups
+): string {
   const reported = priorReportsBlock(prior ?? [], SCHED_CLOSE);
   return [
     `<!--stem:scheduled at="${at}"-->`,
     'This is an automated scheduled run — no human is reading the reply live. Carry out the task.',
+    ...lookupsLine(lookups),
     reported.length
       ? 'This run has no memory of any earlier conversation: the task prompt below and the list of what earlier runs already reported are everything you know about it.'
       : 'This run has no memory of any earlier conversation: the task prompt below is everything you know about it.',
@@ -1347,8 +1353,9 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
       if (input.mail) turn.mail = { conversationId: input.mail.conversationId, participants: input.mail.participants };
       // Inter-Stem external context: full memory to read, but nothing leaves
       // except the user-approved draft. Kept out of Recall too: content from
-      // outside must not become "facts about the user" (contact-tagged capture
-      // is a later step).
+      // outside must not become "facts about the user" (what is learned from
+      // them is extracted separately, tagged with their address:
+      // interstem/contact-memory.ts).
       if (input.mail?.external) {
         turn.external = true;
         this.taintTurn(turn);
@@ -1478,6 +1485,7 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
             // tools are off for the turn (codeRelayRefusal in the extension).
             relay: !!turn.personaHarness,
             external: turn.external === true,
+            contact: turn.external ? input.mail?.external?.address ?? null : null,
             imageGen: imageGen.ok && !turn.external,
             imageGenRefusal: imageGen.ok ? null : imageGen.refusal,
             // The persona's MCP allowlist; buildMessage filters the catalog
@@ -4925,6 +4933,8 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
       const injectedDocs: InjectedDocRef[] = [];
       const recall = await buildRecallContext(input.input, {
         currentThreadId: threadId,
+        // Mail with another person: what Stem learned from them joins the user's memory here, and only here.
+        contact: input.mail?.external?.address ?? null,
         timings: recallTimings,
         chosen,
         flags,
@@ -5148,15 +5158,24 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
     // model knows it's running headless and the persisted message carries the marker.
     // A mail delivery does the same with its own fence — who the mail is from, and
     // that the final message becomes the reply.
+    // Headless turns are told to look things up rather than answer fast — only
+    // with the lookups this turn actually has (mirrors the turn-context gate).
+    const lookups: Lookups | undefined = input.persona?.harness
+      ? undefined
+      : {
+          memory: isRecallEnabled() && input.persona?.recall !== false && !turn?.isPrivate,
+          web: !input.mail?.external
+        };
     const message = input.scheduled
-      ? `${input.scheduled.resumed ? resumedPreamble(input.scheduled.at) : scheduledPreamble(input.scheduled.at, input.persona?.notes, input.scheduled.prior)}\n\n${body}`
+      ? `${input.scheduled.resumed ? resumedPreamble(input.scheduled.at) : scheduledPreamble(input.scheduled.at, input.persona?.notes, input.scheduled.prior, lookups)}\n\n${body}`
       : input.mail
         ? `${mailPreamble(
             input.mail,
             input.persona?.id,
             input.persona?.notes,
             input.persona?.recall === false,
-            input.persona?.answers
+            input.persona?.answers,
+            lookups
           )}\n\n${body}`
         : body;
     return { message, images };
@@ -5482,6 +5501,11 @@ export class PiRuntime extends EventEmitter implements ChatBackend {
    * needs a process restart — done only when no turn is streaming; otherwise the
    * next sync (or any restart) catches up.
    */
+  async refreshLocalModels(): Promise<void> {
+    this.lastLocalSyncAt = 0;
+    await this.maybeRefreshLocalModels();
+  }
+
   private async maybeRefreshLocalModels(): Promise<void> {
     if (Date.now() - this.lastLocalSyncAt < 30_000) return;
     this.lastLocalSyncAt = Date.now();

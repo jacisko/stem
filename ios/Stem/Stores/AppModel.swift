@@ -118,10 +118,13 @@ final class Session {
     let connection: Connection
     let chats: ChatListStore
     let mail: MailStore
+    let interStem: InterStemStore
     let approvals: ApprovalStore
     private(set) var personas: [Persona] = []
     private(set) var models: [ModelSummary] = []
     private(set) var webSearch = false
+    /// Settings → Features → Voice chat; the server refuses a call when it is off.
+    private(set) var voiceAllowed = false
     var prefs = ComposerPrefs.load()
     /// The chat on screen, so a push about it can stay quiet: its reply or
     /// approval card is already in front of the user.
@@ -133,10 +136,12 @@ final class Session {
         connection = Connection(client: client)
         chats = ChatListStore(client: client)
         mail = MailStore(client: client)
+        interStem = InterStemStore(client: client)
         approvals = ApprovalStore(client: client)
         sub = connection.subscribe { [weak self] e in self?.on(e) }
         chats.attach(connection)
         mail.attach(connection)
+        interStem.attach(connection)
         approvals.attach(connection)
         connection.start()
     }
@@ -153,6 +158,8 @@ final class Session {
         if id == "user" { return "You" }
         if id.hasPrefix("task:") { return "Scheduled task" }
         if id == "memory-check" { return "Memory check" }
+        // Another person, by email address: the name the user gave them, if any.
+        if id.contains("@") { return interStem.label(id) }
         // An agent (`<roleId>~<name>`) reads as its name and its role.
         if let sep = id.range(of: "~", options: .backwards), sep.lowerBound > id.startIndex {
             let name = String(id[sep.upperBound...])
@@ -191,7 +198,10 @@ final class Session {
                 }
             }
         }
-        if let s = try? await client.call("settings:get", as: ServerSettings.self) { webSearch = s.webSearch.main }
+        if let s = try? await client.call("settings:get", as: ServerSettings.self) {
+            webSearch = s.webSearch.main
+            voiceAllowed = s.chatFeatures?.voice.map(\.allow) ?? false
+        }
     }
 
     private func loadPersonas() async {

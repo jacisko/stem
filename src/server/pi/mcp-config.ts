@@ -394,6 +394,7 @@ export async function writeTurnContextGate(
     relay: boolean;
     /** Inter-Stem external context: only the read-only allowlist (externalRefusal). */
     external?: boolean;
+    contact?: string | null;
     imageGen?: boolean;
     imageGenRefusal?: string | null;
     mcpServers?: readonly string[] | null;
@@ -437,6 +438,10 @@ export async function writeTurnContextGate(
         recall: ctx.recall,
         relay: ctx.relay,
         external: ctx.external === true,
+        // `contact`: the other person in mail with another Stem — the recall
+        // bridge stamps it on search_facts, so facts learned from that person
+        // answer here and nobody else's do.
+        contact: typeof ctx.contact === 'string' ? ctx.contact : null,
         // `imageGen`: whether generate_image is offered this turn (the bridge
         // also hides it from the tool set when false). Defaults to false.
         imageGen: ctx.imageGen === true,

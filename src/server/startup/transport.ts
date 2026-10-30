@@ -1,4 +1,5 @@
 import { mkdir, stat, writeFile } from 'node:fs/promises';
+import { MAIL_FILE_PREFIX, mailFileDownload } from '../interstem/mail-files';
 import { basename, dirname } from 'node:path';
 import { readableFilePath } from '../files/store';
 import { OUTBOX_PREFIX, outboxTake } from '../files/outbox';
@@ -134,6 +135,8 @@ export async function resolveDownload(rel: string, deviceId?: string): Promise<D
   // A file the server put in this device's outbox (a browser upload): single
   // use and bound to the caller, see files/outbox.ts.
   if (rel.startsWith(OUTBOX_PREFIX)) return deviceId ? outboxTake(deviceId, rel.slice(OUTBOX_PREFIX.length)) : null;
+  // A file in mail with another person (interstem/mail-files.ts).
+  if (rel.startsWith(MAIL_FILE_PREFIX)) return mailFileDownload(rel.slice(MAIL_FILE_PREFIX.length));
   const path = await readableFilePath(rel);
   if (!path) return null;
   return { path, name: basename(path), size: (await stat(path)).size };

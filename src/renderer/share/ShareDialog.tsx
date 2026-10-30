@@ -177,6 +177,8 @@ export function ShareDialog({
                   Works until {new Date(link.expiresAt).toLocaleDateString(undefined, { dateStyle: 'long' })}. The content
                   is encrypted; the key is the part after # in the link, so only people you give the link to can read it.
                   Later messages are not added. Manage your links in Settings → Features.
+                  {link.size >= 2 << 20 &&
+                    ` At ${sizeLabel(link.size)}, the page takes a few seconds to open on a slow connection.`}
                 </p>
               </>
             )}

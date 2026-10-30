@@ -41,6 +41,12 @@ final class ThreadStore {
     /// same message again reuses its turn id and the server answers with the
     /// turn it already started instead of a duplicate chat.
     @ObservationIgnored private var unanswered: (text: String, files: Int, turnId: String)?
+    /// Voice chat (`ask`): callers waiting on a turn's final reply, and the
+    /// recent ends of turns this store saw, for a turn that settled first.
+    @ObservationIgnored private var replyWaiters: [String: CheckedContinuation<String, Error>] = [:]
+    @ObservationIgnored private var settledReplies: [String: Result<String, Error>] = [:]
+    /// What the last successful `send` started, and the reply when the backend answered it itself.
+    @ObservationIgnored private var lastStart: (turnId: String, handledReply: String?)?
 
     init(session: Session, threadId: String?, folderId: String? = nil) {
         self.session = session
@@ -165,6 +171,9 @@ final class ThreadStore {
         let eventTurn = p["turnId"]?.stringValue ?? p["turn"]?["id"]?.stringValue
         if method == "process/exit" {
             if case .object(let o) = p, o.keys.contains("threadId"), eventThread != threadId { return }
+            if eventThread != nil, let turn = activeTurnId {
+                endReply(turn, .failure(StemError(message: "Stem's worker stopped before it answered.")))
+            }
             if running { settleLocally() }
             return
         }
@@ -261,6 +270,10 @@ final class ThreadStore {
         case "turn/completed", "turn/failed", "turn/aborted":
             guard let turn = eventTurn else { return }
             stamp(turn)
+            let reply = messages.last(where: { $0.id == "assistant-\(turn)" })?.content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            endReply(turn, method == "turn/completed"
+                ? (reply.isEmpty ? .failure(StemError(message: "Stem finished without a reply.")) : .success(reply))
+                : .failure(StemError(message: method == "turn/aborted" ? "The reply was stopped." : (p["error"]?.stringValue ?? "Stem could not answer."))))
             if method != "turn/completed" {
                 messages.removeAll { $0.id == "system-\(turn)" }
                 let text = method == "turn/aborted"
@@ -330,6 +343,42 @@ final class ThreadStore {
 
     // MARK: Actions
 
+    // MARK: Voice chat
+
+    /// Ten minutes: a long tool turn, but not a call left waiting forever.
+    static let replyTimeout: Duration = .seconds(600)
+
+    /// A spoken request (PhoneVoice's `ask_stem`): send it as an ordinary
+    /// message in this chat and settle with the reply the turn ends with.
+    /// Requests queue, so this waits for the chat to finish its current reply.
+    func ask(_ request: String, personaId: String?, private isPrivate: Bool) async throws -> String {
+        for _ in 0..<900 where busy { try await Task.sleep(for: .milliseconds(200)) }
+        if busy { throw StemError(message: "Stem is still answering something else in this chat. Ask again when it is done.") }
+        lastStart = nil
+        guard await send(text: request, previews: [], upload: { [] }, personaId: personaId, private: isPrivate),
+              let start = lastStart else {
+            throw StemError(message: error ?? "Stem could not start that request.")
+        }
+        if let reply = start.handledReply { return reply }
+        if let ended = settledReplies.removeValue(forKey: start.turnId) { return try ended.get() }
+        let turn = start.turnId
+        Task { [weak self] in
+            try? await Task.sleep(for: Self.replyTimeout)
+            self?.endReply(turn, .failure(StemError(message: "Stem took too long to answer.")))
+        }
+        return try await withCheckedThrowingContinuation { replyWaiters[turn] = $0 }
+    }
+
+    private func endReply(_ turn: String, _ result: Result<String, Error>) {
+        if let waiter = replyWaiters.removeValue(forKey: turn) {
+            waiter.resume(with: result)
+            return
+        }
+        // Kept briefly for an `ask` whose turn settled before startTurn answered.
+        if settledReplies.count > 8 { settledReplies.removeAll() }
+        settledReplies[turn] = result
+    }
+
     /// Starts a turn. Returns false when the send failed and the draft should stay.
     /// The message shows before `upload` runs, so the bubble doesn't wait on the attachments.
     func send(text: String, previews: [MessageAttachment], upload: () async throws -> [TurnAttachment],
@@ -376,6 +425,7 @@ final class ThreadStore {
             }
             pendingTurnId = nil
             if activityLabel == "Sending" { activityLabel = nil }
+            lastStart = (r.turnId ?? turnId, r.turnId == nil && r.handled == true ? (r.assistantMessage ?? "Done.") : nil)
             if r.canceled == true {
                 if let i = messages.firstIndex(where: { $0.id == localId }) { messages[i].sendFailed = true }
                 settleLocally()

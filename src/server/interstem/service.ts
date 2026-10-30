@@ -7,7 +7,8 @@
 // draft they approved (router resolveSendDraft).
 import { degrade } from '../degrade';
 import { log } from '../log';
-import type { InterStemStatus, MailConversation, MailExternal, MailItem, MailListResult } from '../../shared/types';
+import type { InterStemReach, InterStemStatus, MailConversation, MailExternal, MailItem, MailListResult, MessageAttachment } from '../../shared/types';
+import { MAIL_FILES_MAX_COUNT, putMailFile, readMailFile } from './mail-files';
 import {
   appendMailItem,
   createConversation,
@@ -90,13 +91,28 @@ interface InnerV1 {
   subject?: string;
   body: string;
   sentAt: number;
+  /** Files, sealed with the mail (older Stems ignore the field and show the text). */
+  attachments?: { name: string; mime: string; data: string }[];
+}
+
+/** An outbox entry's files, by mail-file id: read and sealed in only when it goes out. */
+interface OutboxFiles {
+  files?: { fileId: string; name: string; mime: string }[];
 }
 
 const INNER_MAX_BODY = 1_000_000;
+/** Inbound files: a little over what we send (MAIL_FILES_MAX_BYTES), and never more than the relay carries. */
+const INNER_MAX_FILE_BYTES = 20 * 1024 * 1024;
 const OUTBOX_RETRY_MS = [30_000, 120_000, 600_000, 1_800_000, 3_600_000];
 const OUTBOX_GIVE_UP_MS = 7 * 86_400_000;
 const CERT_REFRESH_BEFORE_MS = 2 * 3_600_000;
 const STATUS_WINDOW_MS = 8 * 86_400_000;
+/** How long a mail to someone not on Stem waits for them to join, and how often we look. */
+const WAIT_FOR_JOIN_MS = 30 * 86_400_000;
+const WAIT_CHECK_MS = 6 * 3_600_000;
+/** A compose-time reachability answer is reused this long (lookups are rate-limited). */
+const LOOKUP_CACHE_MS = 10 * 60_000;
+const CONTACT_NAME_MAX = 80;
 
 export interface InterStemOptions {
   store?: InterStemStore;
@@ -108,6 +124,15 @@ export interface InterStemOptions {
   now?: () => number;
   /** The organization's policy (policy.ts); tests inject one. */
   policy?: () => InterStemPolicy;
+  /** A mail from another person was filed (desktop notification, phone push). */
+  onMail?: (mail: { conversationId: string; itemId: string; from: string; name?: string; subject?: string }) => void;
+  /**
+   * A contact the user verified and set to auto-draft wrote: release their mail
+   * and have this persona draft a reply. Sending still waits for the user.
+   */
+  onAutoDraft?: (conversationId: string, itemId: string, personaId: string | undefined) => void;
+  /** Someone the user wrote to before they were on Stem is reachable now. */
+  onJoined?: (mail: { conversationId: string; itemId: string; address: string }) => void;
 }
 
 export class InterStemService {
@@ -121,7 +146,12 @@ export class InterStemService {
   private connected = new Set<string>();
   private timers: NodeJS.Timeout[] = [];
   private outboxRunning = false;
+  private waitingRunning = false;
   private stopped = false;
+  private lookups = new Map<string, { at: number; reach: InterStemReach }>();
+  private onMail: NonNullable<InterStemOptions['onMail']>;
+  private onAutoDraft: NonNullable<InterStemOptions['onAutoDraft']>;
+  private onJoined: NonNullable<InterStemOptions['onJoined']>;
 
   constructor(opts: InterStemOptions = {}) {
     this.store = opts.store ?? interStemStore();
@@ -129,6 +159,9 @@ export class InterStemService {
     this.onChange = opts.onChange ?? (() => undefined);
     this.now = opts.now ?? Date.now;
     this.policy = opts.policy ?? interStemPolicy;
+    this.onMail = opts.onMail ?? (() => undefined);
+    this.onAutoDraft = opts.onAutoDraft ?? (() => undefined);
+    this.onJoined = opts.onJoined ?? (() => undefined);
     this.resolver = new AuthorityResolver(() => this.globalAuthority(), opts.txt, undefined, this.policy);
   }
 
@@ -152,10 +185,12 @@ export class InterStemService {
     this.timers.push(
       setInterval(() => void this.processOutbox(), 30_000),
       setInterval(() => void this.refreshCerts(), 30 * 60_000),
-      setInterval(() => void this.pollStatuses(), 5 * 60_000)
+      setInterval(() => void this.pollStatuses(), 5 * 60_000),
+      setInterval(() => void this.checkWaiting(), 30 * 60_000)
     );
     for (const t of this.timers) t.unref?.();
     void this.processOutbox();
+    void this.checkWaiting();
   }
 
   /**
@@ -234,14 +269,19 @@ export class InterStemService {
       ...(policy.mode === 'open'
         ? {}
         : { policy: policy.mode === 'off' ? { mode: 'off' } : { mode: 'restricted', domains: policy.domains } }),
-      contacts: Object.values(s.contacts).map(({ address, state, keyFp, verifiedByUser, keyChanged, firstSeen }) => ({
-        address,
-        state,
-        keyFp,
-        firstSeen,
-        ...(verifiedByUser ? { verifiedByUser } : {}),
-        ...(keyChanged ? { keyChanged } : {})
-      }))
+      contacts: Object.values(s.contacts).map(
+        ({ address, state, keyFp, verifiedByUser, keyChanged, firstSeen, name, autoDraft, draftPersona }) => ({
+          address,
+          state,
+          keyFp,
+          firstSeen,
+          ...(verifiedByUser ? { verifiedByUser } : {}),
+          ...(keyChanged ? { keyChanged } : {}),
+          ...(name ? { name } : {}),
+          ...(autoDraft && verifiedByUser ? { autoDraft } : {}),
+          ...(draftPersona ? { draftPersona } : {})
+        })
+      )
     };
   }
 
@@ -518,13 +558,20 @@ export class InterStemService {
         typeof parsed.body === 'string' &&
         /^[0-9a-f]{32}$/.test(parsed.thread ?? '')
       ) {
+        const files = Array.isArray(parsed.attachments)
+          ? parsed.attachments
+              .filter((a) => a && typeof a.name === 'string' && typeof a.data === 'string')
+              .slice(0, MAIL_FILES_MAX_COUNT)
+              .map((a) => ({ name: a.name, mime: typeof a.mime === 'string' ? a.mime : 'application/octet-stream', data: a.data }))
+          : [];
         inner = {
           v: 1,
           kind: 'mail',
           thread: parsed.thread!,
           body: parsed.body.slice(0, INNER_MAX_BODY),
           sentAt: typeof parsed.sentAt === 'number' ? parsed.sentAt : env.ts,
-          ...(typeof parsed.subject === 'string' ? { subject: parsed.subject.slice(0, 300) } : {})
+          ...(typeof parsed.subject === 'string' ? { subject: parsed.subject.slice(0, 300) } : {}),
+          ...(files.length ? { attachments: files } : {})
         };
       } else {
         unsupported = true;
@@ -543,14 +590,18 @@ export class InterStemService {
         s.contacts[env.from] = { address: env.from, state: 'request', authKey: signer, keyFp, firstSeen: this.now() };
       } else if (!c.authKey) {
         // A contact made before we ever saw their key (blocked or accepted by
-        // address): this is their first key, not a changed one.
+        // address): this is their first key, not a changed one. Nobody has
+        // checked it in person.
         c.authKey = signer;
         c.keyFp = keyFp;
+        delete c.verifiedByUser;
+        delete c.autoDraft;
       } else if (c.authKey !== signer) {
         keyChanged = true;
         c.keyChanged = true;
         c.pendingAuthKey = signer;
         delete c.pendingEncKey;
+        delete c.autoDraft; // back on only after the user checks the new key
       }
     });
 
@@ -568,16 +619,68 @@ export class InterStemService {
       ...(keyChanged ? { keyChanged: true } : {}),
       ...(unsupported ? { unsupported: true } : {})
     };
-    await this.mail.appendMailItem({
+    const attachments = inner?.attachments?.length ? await this.fileAttachments(inner.attachments) : [];
+    const filed = await this.mail.appendMailItem({
       conversationId: conversation.id,
       from: env.from,
       to: ['user'],
       body,
       ...(inner?.subject ? { subject: inner.subject } : {}),
+      ...(attachments.length ? { attachments } : {}),
       external
     });
     await done();
     this.onChange();
+    const itemId = filed.items.find((i) => i.external?.envelopeId === env.id)?.id;
+    if (!itemId) return;
+    const after = (await this.store.read()).contacts[env.from];
+    this.onMail({
+      conversationId: conversation.id,
+      itemId,
+      from: env.from,
+      ...(after?.name ? { name: after.name } : {}),
+      ...(conversation.subject || inner?.subject ? { subject: inner?.subject || conversation.subject } : {})
+    });
+    // Auto-draft only for someone the user checked in person, whose key is the
+    // one they checked, in a format we understand.
+    if (
+      after?.state === 'accepted' &&
+      after.verifiedByUser &&
+      after.autoDraft &&
+      !after.keyChanged &&
+      !keyChanged &&
+      !unsupported
+    ) {
+      this.onAutoDraft(conversation.id, itemId, after.draftPersona);
+    }
+  }
+
+  /**
+   * Keep a received mail's files in the mail-file store; past the cap the rest
+   * are named, not kept. The bytes are someone else's and arrive before the
+   * user has looked: sizes are checked before decoding, and nothing is run
+   * through an image converter — a picture gets a thumbnail only when it is a
+   * format the viewer shows as it is (inboundPreview).
+   */
+  private async fileAttachments(files: NonNullable<InnerV1['attachments']>): Promise<MessageAttachment[]> {
+    const out: MessageAttachment[] = [];
+    let total = 0;
+    for (const f of files) {
+      total += Math.floor((f.data.length * 3) / 4);
+      if (total > INNER_MAX_FILE_BYTES) {
+        out.push({ kind: 'file', name: `${f.name} (too large, not kept)` });
+        continue;
+      }
+      try {
+        const bytes = Buffer.from(f.data, 'base64');
+        const stored = await putMailFile(bytes, f.name, f.mime);
+        out.push(inboundPreview(stored, bytes));
+      } catch (err) {
+        degrade('interstem', 'could not keep a received file', err);
+        out.push({ kind: 'file', name: `${f.name} (could not be kept)` });
+      }
+    }
+    return out;
   }
 
   // ---- contacts ----
@@ -633,12 +736,19 @@ export class InterStemService {
   /** The user compared fingerprints in person. */
   async markVerified(raw: string, verified: boolean): Promise<InterStemStatus> {
     const address = normalizeAddress(raw);
-    await this.store.update((s) => {
+    const out = await this.store.update((s) => {
       const c = s.contacts[address];
       if (!c) return false;
+      // There is nothing to have compared before a key is pinned: a later first
+      // key would inherit the check (and with it auto-draft) unseen.
+      if (verified && !c.authKey) return 'nokey' as const;
       c.verifiedByUser = verified || undefined;
-      if (!verified) delete c.verifiedByUser;
+      if (!verified) {
+        delete c.verifiedByUser;
+        delete c.autoDraft; // auto-draft rests on the in-person check
+      }
     });
+    if (out === 'nokey') throw new Error('There is no key to check yet: they haven’t written, and you haven’t written to them.');
     this.onChange();
     return this.status();
   }
@@ -659,6 +769,7 @@ export class InterStemService {
       delete c.pendingEncKey;
       delete c.keyChanged;
       delete c.verifiedByUser; // a new key is a new person until checked again
+      delete c.autoDraft;
     });
     // Sends that stopped on the change go out now, to the adopted key.
     const { items } = await this.mail.readMail();
@@ -668,6 +779,76 @@ export class InterStemService {
     }
     this.onChange();
     return this.status();
+  }
+
+  /**
+   * The user's own settings for a contact: a name, and auto-draft (only for a
+   * contact they verified in person).
+   */
+  async setContact(raw: string, patch: { name?: string | null; autoDraft?: boolean }): Promise<InterStemStatus> {
+    const address = normalizeAddress(raw);
+    if (!validAddress(address)) throw new Error('That is not an email address.');
+    const out = await this.store.update((s) => {
+      const c = s.contacts[address];
+      if (!c) return 'unknown' as const;
+      if (patch.name !== undefined) {
+        const name = (patch.name ?? '').replace(/\s+/g, ' ').trim().slice(0, CONTACT_NAME_MAX);
+        if (name) c.name = name;
+        else delete c.name;
+      }
+      if (patch.autoDraft !== undefined) {
+        if (patch.autoDraft && !c.verifiedByUser) return 'unverified' as const;
+        if (patch.autoDraft) c.autoDraft = true;
+        else delete c.autoDraft;
+      }
+      return 'ok' as const;
+    });
+    if (out === 'unknown') throw new Error('Write to them first: they become a contact once you have.');
+    if (out === 'unverified') throw new Error('Check their key with them first (Verify), then turn on automatic drafts.');
+    this.onChange();
+    return this.status();
+  }
+
+  /** Remember which persona drafted for a contact: the default next time. */
+  async recordDraftPersona(raw: string, personaId: string): Promise<void> {
+    const address = normalizeAddress(raw);
+    await this.store.update((s) => {
+      const c = s.contacts[address];
+      if (!c || c.draftPersona === personaId) return false;
+      c.draftPersona = personaId;
+    });
+    this.onChange();
+  }
+
+  /**
+   * Can this address be mailed? Asked while the user writes, so the answer is
+   * cached for a while: lookups are rate-limited on the relay.
+   */
+  async lookup(raw: string): Promise<InterStemReach> {
+    const address = normalizeAddress(raw);
+    if (!validAddress(address)) return { state: 'unreachable' };
+    const state = await this.store.read();
+    if (state.addresses.some((a) => a.address === address)) return { state: 'self' };
+    const contact = state.contacts[address];
+    if (contact?.state === 'blocked') return { state: 'blocked' };
+    try {
+      assertAddressAllowed(this.policy(), address);
+    } catch (err) {
+      if (err instanceof PolicyError) return { state: 'refused', reason: err.message };
+      throw err;
+    }
+    // Someone we have a key for is reachable without asking the relay.
+    if (contact?.encKey && !contact.keyChanged) return { state: 'reachable' };
+    const cached = this.lookups.get(address);
+    if (cached && this.now() - cached.at < LOOKUP_CACHE_MS) return cached.reach;
+    const self = await this.defaultSelf();
+    if (!self) throw new Error('Verify one of your addresses first.');
+    const id = await this.freshCert(self);
+    const { relay } = await this.resolver.authority(address);
+    const found = await lookupKey(relay, id, address);
+    const reach: InterStemReach = { state: found ? 'reachable' : 'unreachable' };
+    this.lookups.set(address, { at: this.now(), reach });
+    return reach;
   }
 
   /** Ask their relay to invite an address that isn't reachable. Always "ok". */
@@ -696,16 +877,21 @@ export class InterStemService {
       this.onChange();
       return;
     }
-    const inner: InnerV1 = {
+    const files = (item.attachments ?? []).flatMap((a) =>
+      a.fileId ? [{ fileId: a.fileId, name: a.name ?? 'file', mime: a.mime ?? 'application/octet-stream' }] : []
+    );
+    const inner: InnerV1 & OutboxFiles = {
       v: 1,
       kind: 'mail',
       thread,
       body: item.body,
       sentAt: item.at,
-      ...(conversation.subject ? { subject: conversation.subject } : {})
+      ...(conversation.subject ? { subject: conversation.subject } : {}),
+      ...(files.length ? { files } : {})
     };
     await this.store.update((s) => {
       s.outbox = s.outbox.filter((o) => o.mailItemId !== itemId);
+      s.waiting = s.waiting.filter((w) => w.mailItemId !== itemId);
       s.outbox.push({
         id: newId(),
         mailItemId: itemId,
@@ -718,8 +904,71 @@ export class InterStemService {
         createdAt: this.now()
       });
     });
-    await this.mail.setExternalStatus(itemId, { status: 'queued' });
+    await this.mail.setExternalStatus(itemId, { status: 'queued', error: undefined });
     await this.processOutbox();
+  }
+
+  /**
+   * The user sends one of their mails again: one that waited for its
+   * recipient to join Stem, or one that failed. A mail that went out is not
+   * resent (it would arrive twice).
+   */
+  async resend(conversationId: string, itemId: string): Promise<void> {
+    const { items } = await this.mail.readMail();
+    const item = items.find((i) => i.id === itemId && i.conversationId === conversationId);
+    if (!item || item.from !== 'user' || !item.external) throw new Error('That mail is not yours to send.');
+    const status = item.external.status;
+    if (status === 'queued' || status === 'sent' || status === 'delivered') throw new Error('That mail is already on its way.');
+    this.lookups.clear();
+    await this.send(conversationId, itemId);
+  }
+
+  /**
+   * Mail waiting for someone to join Stem: look them up now and then. Once
+   * they are reachable the item says so and the user sends it (the design's
+   * "offered for sending"): weeks may have passed, so it is never sent blind.
+   */
+  async checkWaiting(): Promise<void> {
+    if (this.waitingRunning) return;
+    this.waitingRunning = true;
+    try {
+      const state = await this.store.read();
+      const now = this.now();
+      const expired = state.waiting.filter((w) => now - w.since > WAIT_FOR_JOIN_MS);
+      for (const w of expired) {
+        await this.mail.setExternalStatus(w.mailItemId, {
+          status: 'unreachable',
+          error: `${w.to} didn't join Stem within 30 days. Send it again if you still want to.`
+        });
+      }
+      const due = state.waiting.filter((w) => now - w.since <= WAIT_FOR_JOIN_MS && now - w.checkedAt >= WAIT_CHECK_MS);
+      const joined = new Set<string>();
+      const checked = new Set<string>();
+      for (const to of new Set(due.map((w) => w.to))) {
+        const w = due.find((x) => x.to === to)!;
+        try {
+          const id = await this.freshCert(w.from);
+          const { relay } = await this.resolver.authority(to);
+          if (await lookupKey(relay, id, to)) joined.add(to);
+          checked.add(to);
+        } catch (err) {
+          degrade('interstem', `could not look ${to} up again`, err);
+        }
+      }
+      for (const w of due.filter((x) => joined.has(x.to))) {
+        await this.mail.setExternalStatus(w.mailItemId, { status: 'joined', error: undefined });
+        this.onJoined({ conversationId: w.conversationId, itemId: w.mailItemId, address: w.to });
+      }
+      if (!expired.length && !checked.size) return;
+      await this.store.update((s) => {
+        s.waiting = s.waiting
+          .filter((w) => now - w.since <= WAIT_FOR_JOIN_MS && !joined.has(w.to))
+          .map((w) => (checked.has(w.to) ? { ...w, checkedAt: now } : w));
+      });
+      this.onChange();
+    } finally {
+      this.waitingRunning = false;
+    }
   }
 
   /** Send everything due. One pass at a time. */
@@ -786,6 +1035,7 @@ export class InterStemService {
         c.keyChanged = true;
         c.pendingAuthKey = found.authKey;
         c.pendingEncKey = b64(keys.encPub);
+        delete c.autoDraft;
       });
       this.onChange();
       return { status: 'key-changed' };
@@ -797,6 +1047,8 @@ export class InterStemService {
         if (!c.authKey) {
           c.authKey = found.authKey;
           c.keyFp = fingerprint(keys.sigPub);
+          delete c.verifiedByUser;
+          delete c.autoDraft;
         }
       } else
         s.contacts[to] = {
@@ -819,19 +1071,35 @@ export class InterStemService {
     const { relay } = await this.resolver.authority(entry.to);
     const key = await this.recipientKey(entry.to, id, relay);
     if ('status' in key) {
-      await this.mail.setExternalStatus(entry.mailItemId, {
-        status: key.status,
-        ...(key.status === 'unreachable'
-          ? {
-              error: `${entry.to} can't be reached through Stem: they aren't on Stem, or only accept mail from people they've written to.`
-            }
-          : { error: `${entry.to}'s key changed. Check it, then send again.` })
-      });
+      if (key.status === 'unreachable') {
+        // Kept here, and looked for now and then (checkWaiting).
+        await this.mail.setExternalStatus(entry.mailItemId, {
+          status: 'waiting',
+          error: `${entry.to} isn't on Stem yet (or only takes mail from people they've written to). Your mail stays here, and Stem tells you when they can be reached.`
+        });
+        await this.store.update((s) => {
+          s.waiting = s.waiting.filter((w) => w.mailItemId !== entry.mailItemId);
+          s.waiting.push({
+            mailItemId: entry.mailItemId,
+            conversationId: entry.conversationId,
+            from: entry.from,
+            to: entry.to,
+            since: this.now(),
+            checkedAt: this.now()
+          });
+        });
+      } else {
+        await this.mail.setExternalStatus(entry.mailItemId, {
+          status: key.status,
+          error: `${entry.to}'s key changed. Check it, then send again.`
+        });
+      }
       this.onChange();
       return { done: true };
     }
     const envelopeId = newId();
-    const sealed = seal(key.enc, Buffer.from(entry.inner), envelopeId, entry.from, entry.to);
+    const plain = await this.withFiles(entry.inner);
+    const sealed = seal(key.enc, Buffer.from(plain), envelopeId, entry.from, entry.to);
     const env = signEnvelope(
       { v: 1, id: envelopeId, ts: this.now(), from: entry.from, to: entry.to, cert: id.cert!, sealed: b64(sealed) },
       id.seed
@@ -863,8 +1131,28 @@ export class InterStemService {
     }
     await this.store.update((s) => {
       s.sent.push({ envelopeId, mailItemId: entry.mailItemId, from: entry.from, to: entry.to, at: this.now() });
+      // Answering a Request accepts it: their next mail lands in the Inbox.
+      const c = s.contacts[entry.to];
+      if (c?.state === 'request') c.state = 'accepted';
     });
+    this.onChange();
     return { done: true };
+  }
+
+  /** The sealed payload: the outbox's file references replaced by the files themselves. */
+  private async withFiles(innerJson: string): Promise<string> {
+    const inner = JSON.parse(innerJson) as InnerV1 & OutboxFiles;
+    if (!inner.files?.length) return innerJson;
+    const attachments: NonNullable<InnerV1['attachments']> = [];
+    for (const f of inner.files) {
+      const file = await readMailFile(f.fileId);
+      // A file gone from the store can't be sent; the mail says what is missing.
+      if (!file) throw new PolicyError(`The file ${f.name} is no longer here, so the mail can't be sent.`);
+      attachments.push({ name: file.name, mime: file.mime, data: file.bytes.toString('base64') });
+    }
+    const rest: InnerV1 & OutboxFiles = { ...inner };
+    delete rest.files;
+    return JSON.stringify({ ...rest, attachments });
   }
 
   /** Learn delivery for recent sends (the relay only tells contacts who allowed us). */
@@ -904,6 +1192,22 @@ export class ShareUnavailableError extends Error {
   ) {
     super(message);
   }
+}
+
+/** Pictures a mail viewer shows straight from their bytes, by their magic numbers. */
+const SAFE_IMAGES: Array<{ mime: string; magic: (b: Buffer) => boolean }> = [
+  { mime: 'image/png', magic: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  { mime: 'image/jpeg', magic: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { mime: 'image/gif', magic: (b) => b.subarray(0, 4).toString('latin1') === 'GIF8' },
+  { mime: 'image/webp', magic: (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP' }
+];
+const INBOUND_PREVIEW_MAX = 2 * 1024 * 1024;
+
+/** A received file as it shows on its mail: a picture of a safe format inline, anything else a named chip. */
+function inboundPreview(file: { id: string; name: string; mime: string; size: number }, bytes: Buffer): MessageAttachment {
+  const safe = SAFE_IMAGES.find((s) => s.magic(bytes));
+  const base: MessageAttachment = { kind: safe ? 'image' : 'file', name: file.name, mime: safe?.mime ?? file.mime, fileId: file.id, size: file.size };
+  return safe && bytes.length <= INBOUND_PREVIEW_MAX ? { ...base, dataUrl: `data:${safe.mime};base64,${bytes.toString('base64')}` } : base;
 }
 
 export function isHeld(item: Pick<MailItem, 'external'>): boolean {

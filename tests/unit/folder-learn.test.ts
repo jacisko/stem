@@ -5,8 +5,11 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type { ConnectedFolder } from '../../src/shared/types';
 import { FolderIndexStore } from '../../src/server/folder-index/store';
 import {
+  CLAUDE_FOLDER_CONTEXT,
+  CLAUDE_USER_MEMORY_CONFIDENCE,
   DOC_DISTILL_INSTRUCTIONS,
   DOC_FACT_CONFIDENCE,
+  learnScope,
   PER_DOC_CHAR_CAP,
   buildLearnBatch,
   learnFolderBatch
@@ -130,6 +133,64 @@ describe('buildLearnBatch', () => {
       const tight = buildLearnBatch(store, 100)!;
       expect(tight.docs).toHaveLength(1);
       expect(tight.docs[0].relPath).toBe('big.md');
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe('the Claude Code folder', () => {
+  it('learns only memory/ in use mode, everything in new/all, nothing for other folders in use', () => {
+    const claude = fakeFolder('cc', { kind: 'claude' });
+    expect(learnScope(claude, 'use')).toBe('memory/');
+    expect(learnScope(claude, 'all')).toBe('');
+    expect(learnScope(claude, 'off')).toBeNull();
+    expect(learnScope(fakeFolder('plain'), 'use')).toBeNull();
+  });
+
+  it('batches only the scoped docs, tells the model the layout, and trusts user memory more', async () => {
+    const store = freshStore();
+    try {
+      store.upsertDoc({ relPath: 'sessions/app/2026-10-01-x.md', title: 'S', text: '## You\nhi', mtime: 1000, size: 1, hash: 's1' }, 1);
+      store.upsertDoc({ relPath: 'memory/user/app/tabs.md', title: 'T', text: 'The user prefers tabs.', mtime: 2000, size: 1, hash: 'm1' }, 1);
+      store.upsertDoc({ relPath: 'memory/project/app/deploy.md', title: 'D', text: 'App deploys to Hetzner.', mtime: 3000, size: 1, hash: 'm2' }, 1);
+      expect(store.pendingLearnCount('memory/')).toBe(2);
+      expect(store.pendingLearnCount()).toBe(3);
+      expect(buildLearnBatch(store, undefined, 'memory/')!.docs.map((d) => d.relPath)).toEqual([
+        'memory/user/app/tabs.md',
+        'memory/project/app/deploy.md'
+      ]);
+
+      let prompt = '';
+      const claim = (text: string, doc: number) => ({
+        text,
+        category: 'preference',
+        sensitivity: 'standard',
+        validUntil: null,
+        evidenceDocIds: [doc],
+        supersedesFactIds: [],
+        conflictsWithFactIds: []
+      });
+      const res = await learnFolderBatch(
+        store,
+        fakeFolder('cc-learn', { kind: 'claude', learnMode: 'use' }),
+        {
+          complete: async (p) => {
+            prompt = p;
+            return claimsReply([claim('The user prefers tabs over spaces in app.', 1), claim('The user deploys app to Hetzner.', 2)]);
+          }
+        },
+        'memory/'
+      );
+      expect(res).toEqual({ processed: 2, written: 2 });
+      expect(prompt).toContain(CLAUDE_FOLDER_CONTEXT);
+      expect(prompt).not.toContain('sessions/app/');
+      // The session transcript is still waiting for 'use' — it was never in the batch.
+      expect(store.pendingLearnCount()).toBe(1);
+      const facts = recallStore.getAllFacts().filter((f) => f.source === 'folder:cc-learn');
+      const byText = new Map(facts.map((f) => [f.text, f.confidence]));
+      expect(byText.get('The user prefers tabs over spaces in app.')).toBeCloseTo(CLAUDE_USER_MEMORY_CONFIDENCE, 5);
+      expect(byText.get('The user deploys app to Hetzner.')).toBeCloseTo(DOC_FACT_CONFIDENCE, 5);
     } finally {
       store.close();
     }

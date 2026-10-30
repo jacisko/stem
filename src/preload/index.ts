@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { startCapture, stopCapture } from './dictation-capture';
 import type {
   FolderSettings,
+  ServerUpgradeStatus,
   ActivitySnapshot,
   ApprovalResolvedPayload,
   ApiKeyProviderId,
@@ -31,7 +32,7 @@ import type {
   LocalEmbedStatus,
   LocalProviderApi,
   LocalProviderId,
-  LocalProviderSettings,
+  LocalProviderPatch,
   LocalRerankStatus,
   FactRerankStatus,
   McpAdminProposal,
@@ -94,10 +95,17 @@ const api: StemApi = {
     ipcRenderer.invoke('auth:respond', requestId, value),
   providerLoginCancel: () => ipcRenderer.invoke('auth:cancel'),
   setApiKey: (provider: ApiKeyProviderId, key: string) => ipcRenderer.invoke('auth:setApiKey', provider, key),
-  updateLocalProvider: (id: LocalProviderId, patch: Partial<LocalProviderSettings>) =>
+  updateLocalProvider: (id: LocalProviderId, patch: LocalProviderPatch) =>
     ipcRenderer.invoke('providers:updateLocal', id, patch),
-  testLocalProvider: (id: LocalProviderId, baseUrl: string, apiKey?: string, api?: LocalProviderApi) =>
-    ipcRenderer.invoke('providers:testLocal', id, baseUrl, apiKey, api),
+  testLocalProvider: (
+    id: LocalProviderId,
+    baseUrl: string,
+    apiKey?: string,
+    api?: LocalProviderApi,
+    deviceId?: string | null
+  ) => ipcRenderer.invoke('providers:testLocal', id, baseUrl, apiKey, api, deviceId),
+  localProviderHealth: () => ipcRenderer.invoke('providers:localHealth'),
+  refreshLocalProviders: () => ipcRenderer.invoke('providers:refreshLocal'),
   disconnectProvider: (providerId: string) => ipcRenderer.invoke('providers:disconnect', providerId),
   checkAuth: (provider: string) => ipcRenderer.invoke('auth:check', provider),
   completeOnboarding: () => ipcRenderer.invoke('auth:completeOnboarding'),
@@ -162,6 +170,7 @@ const api: StemApi = {
       : ipcRenderer.invoke('cfolders:suggest', target),
   browseServerFolders: (path?: string) => ipcRenderer.invoke('cfolders:browse', path),
   addClientFolders: (paths: string[]) => ipcRenderer.invoke('mirror:addLocal', paths),
+  prepareClaudeCodeFolder: () => ipcRenderer.invoke('claude:prepareLocal'),
   mirrorLocalState: () => ipcRenderer.invoke('mirror:localState'),
   mirrorSkippedFiles: (id: string) => ipcRenderer.invoke('cfolders:skipped', id),
 
@@ -461,6 +470,8 @@ const api: StemApi = {
     ipcRenderer.invoke('chats:rollbackToTurn', threadId, turnId),
   forkThread: (threadId: string, turnId: string) => ipcRenderer.invoke('chats:forkThread', threadId, turnId),
   compactChat: (threadId: string, instructions?: string) => ipcRenderer.invoke('chats:compact', threadId, instructions),
+  voiceConnect: (offerSdp: string) => ipcRenderer.invoke('voice:connect', offerSdp),
+  voiceCheck: () => ipcRenderer.invoke('voice:check'),
   listPins: (threadId: string) => ipcRenderer.invoke('pins:list', threadId),
   addPin: (threadId: string, input: ChatPinInput) => ipcRenderer.invoke('pins:add', threadId, input),
   updatePin: (threadId: string, pinId: string, patch: ChatPinPatch) =>
@@ -523,11 +534,17 @@ const api: StemApi = {
     body !== undefined
       ? ipcRenderer.invoke('mail:resolveApproval', itemId, decision, body)
       : ipcRenderer.invoke('mail:resolveApproval', itemId, decision),
-  composeExternalMail: (input: { to: string; subject?: string; body: string; self?: string }) =>
+  composeExternalMail: (input: { to: string; subject?: string; body: string; self?: string; attachments?: TurnAttachment[] }) =>
     ipcRenderer.invoke('mail:composeExternal', input),
   releaseMail: (conversationId: string, itemId: string) => ipcRenderer.invoke('mail:release', conversationId, itemId),
-  draftExternalMail: (conversationId: string, personaId: string, instructions?: string) =>
-    ipcRenderer.invoke('mail:draftExternal', conversationId, personaId, instructions ?? ''),
+  draftExternalMail: (conversationId: string, personaId: string, instructions?: string, release?: boolean) =>
+    ipcRenderer.invoke('mail:draftExternal', conversationId, personaId, instructions ?? '', release === true),
+  resendExternalMail: (conversationId: string, itemId: string) => ipcRenderer.invoke('mail:resendExternal', conversationId, itemId),
+  interStemLookup: (address: string) => ipcRenderer.invoke('interstem:lookup', address),
+  interStemContactMemory: (address: string) => ipcRenderer.invoke('interstem:contactMemory', address),
+  interStemForgetContact: (address: string) => ipcRenderer.invoke('interstem:forgetContact', address),
+  interStemSetContact: (address: string, patch: { name?: string | null; autoDraft?: boolean }) =>
+    ipcRenderer.invoke('interstem:setContact', address, patch),
   interStemStatus: () => ipcRenderer.invoke('interstem:status'),
   interStemAddAddress: (address: string) => ipcRenderer.invoke('interstem:addAddress', address),
   interStemVerifyAddress: (address: string, code: string) => ipcRenderer.invoke('interstem:verifyAddress', address, code),
@@ -541,6 +558,16 @@ const api: StemApi = {
     const handler = () => listener();
     ipcRenderer.on('interstem:changed', handler);
     return () => ipcRenderer.removeListener('interstem:changed', handler);
+  },
+  onOpenMailConversation: (listener: (conversationId: string) => void) => {
+    const handler = (_e: unknown, p: { conversationId: string }) => listener(p.conversationId);
+    ipcRenderer.on('mail:openConversation', handler);
+    return () => ipcRenderer.removeListener('mail:openConversation', handler);
+  },
+  onInterStemMail: (listener: (mail: { conversationId: string; from: string; name?: string; subject?: string }) => void) => {
+    const handler = (_e: unknown, mail: { conversationId: string; from: string; name?: string; subject?: string }) => listener(mail);
+    ipcRenderer.on('interstem:mail', handler);
+    return () => ipcRenderer.removeListener('interstem:mail', handler);
   },
   setMailRead: (conversationIds: string[], read: boolean) =>
     ipcRenderer.invoke('mail:setRead', conversationIds, read),
@@ -601,6 +628,14 @@ const api: StemApi = {
   },
 
   listDevices: () => ipcRenderer.invoke('devices:list'),
+  serverUpgradeStatus: () => ipcRenderer.invoke('serverUpgrade:status'),
+  startServerUpgrade: () => ipcRenderer.invoke('serverUpgrade:start'),
+  setServerAutoUpgrade: (auto: boolean) => ipcRenderer.invoke('serverUpgrade:setAuto', auto),
+  onServerUpgradeChanged: (listener: (status: ServerUpgradeStatus) => void) => {
+    const handler = (_e: unknown, status: ServerUpgradeStatus) => listener(status);
+    ipcRenderer.on('serverUpgrade:changed', handler);
+    return () => ipcRenderer.removeListener('serverUpgrade:changed', handler);
+  },
   revokeDevice: (id: string) => ipcRenderer.invoke('devices:revoke', id),
   createPairingCode: (label: string) => ipcRenderer.invoke('devices:createPairingCode', label),
   clientInfo: () => ipcRenderer.invoke('client:info'),

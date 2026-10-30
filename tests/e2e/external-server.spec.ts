@@ -37,7 +37,7 @@
 // duplicating them here would roughly double a serial Electron suite to re-test
 // one `if` in desktop/index.ts.
 import { expect, closeApp, launchApp, mainWindowOf, test, type LaunchedApp } from './electron';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
@@ -54,6 +54,14 @@ async function send(win: Page, text: string): Promise<void> {
 // one session anyway (the thread the first one starts is what the later ones open).
 test.describe.configure({ mode: 'serial' });
 
+// A fixture ~/.claude for the Claude Code folder test, outside both processes' state.
+const claudeDir = mkdtempSync(join(tmpdir(), 'stem-e2e-claude-'));
+mkdirSync(join(claudeDir, 'projects', '-work-app'), { recursive: true });
+writeFileSync(
+  join(claudeDir, 'projects', '-work-app', 'aaaaaaaa-1111.jsonl'),
+  JSON.stringify({ type: 'user', message: { role: 'user', content: 'Plan the release' }, timestamp: '2026-10-19T15:07:00Z' })
+);
+
 test.describe('against an externally started stem-server', () => {
   let launched: LaunchedApp;
   let win: Page;
@@ -61,6 +69,7 @@ test.describe('against an externally started stem-server', () => {
   test.beforeAll(async () => {
     launched = await launchApp({
       externalServer: true,
+      env: { CLAUDE_CONFIG_DIR: claudeDir, STEM_CLAUDE_COWORK_DIR: join(claudeDir, 'no-cowork') },
       seedSettings: {
         onboarding: { completed: true },
         // A "What's new" modal over the composer would block every send below.
@@ -76,6 +85,7 @@ test.describe('against an externally started stem-server', () => {
 
   test.afterAll(async () => {
     await closeApp(launched);
+    rmSync(claudeDir, { recursive: true, force: true });
   });
 
   test('the app got in by pairing, not by reading a credential off the disk', async () => {
@@ -227,6 +237,19 @@ test.describe('against an externally started stem-server', () => {
     );
     expect(saved).toBe(join(launched.userDataDir, 'downloads', 'brief.txt'));
     expect(readFileSync(saved, 'utf8')).toBe(body);
+  });
+
+  test('the Claude Code folder is converted here and mirrored up as text', async () => {
+    // The raw session never crosses: the client converts it into its own copy
+    // and mirrors that, so the server's mirror holds the Markdown only.
+    const prepared = await win.evaluate(() => (window as any).stem.prepareClaudeCodeFolder());
+    expect(prepared.label).toMatch(/^Claude Code \(.+\)$/);
+    const added = await win.evaluate((p) => (window as any).stem.addClientFolders([p]), prepared.path);
+    const folder = added.find((f: any) => f.origin?.clientPath === prepared.path);
+    expect(folder).toBeTruthy();
+    const rel = join('sessions', 'work-app', '2026-10-19-plan-the-release-aaaaaaaa.md');
+    await expect.poll(() => existsSync(join(folder.path, rel)), { timeout: 15_000 }).toBe(true);
+    expect(readFileSync(join(folder.path, rel), 'utf8')).toContain('## You');
   });
 
   test('the Files panel offers Download and not "open in Finder"', async () => {

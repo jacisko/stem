@@ -220,6 +220,18 @@ export class ProviderAuth {
     }
   }
 
+  /**
+   * A live access token for a stored OAuth credential, refreshed (under pi's
+   * file lock) when expired — for the few calls Stem makes to a provider
+   * itself, outside a pi turn (voice chat). Undefined when not signed in.
+   */
+  async accessToken(provider: string): Promise<string | undefined> {
+    const { readStoredCredential } = await this.loadPi();
+    if (readStoredCredential(provider, this.authPath)?.type !== 'oauth') return undefined;
+    const runtime = await this.createRuntime();
+    return (await runtime.getAuth(provider))?.auth.apiKey;
+  }
+
   private awaitInput(active: ActiveLogin, message: string, placeholder?: string): Promise<string> {
     const requestId = randomUUID();
     return new Promise<string>((resolve, reject) => {

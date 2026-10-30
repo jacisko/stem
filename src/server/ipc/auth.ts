@@ -1,7 +1,7 @@
 import { registerServer } from './guard';
 import type { IpcDeps } from './deps';
 import { markOnboardingCompleted, readSettings, updateDefaultModel, updateLocalProvider } from '../workspace/settings';
-import { probeLocalProvider, syncModelsConfig } from '../pi/models-config';
+import { localProviderHealth, probeLocalProvider, probeLocalProviderOn, syncModelsConfig } from '../pi/models-config';
 import { parseModelOverrides } from '../pi/model-overrides';
 import { relayCallback } from '../pi/oauth-courier';
 import { isCustomProviderId, isLocalProviderId } from '../../shared/providers';
@@ -10,7 +10,7 @@ import type {
   AuthProviderId,
   LocalProviderApi,
   LocalProviderId,
-  LocalProviderSettings
+  LocalProviderPatch
 } from '../../shared/types';
 
 /** The user code the E2E fake shows for the device-code flow (asserted by the wizard spec). */
@@ -88,11 +88,22 @@ export function registerAuthIpc(deps: IpcDeps): void {
     if (deps.e2e) return { alive: true };
     return { alive: await deps.providerAuth()!.isAlive(provider) };
   });
-  registerServer('providers:testLocal', async (_e, _id: LocalProviderId, baseUrl: string, apiKey?: string, api?: LocalProviderApi) => {
-    if (deps.e2e) return { ok: true, models: ['stem-e2e-model'] };
-    return probeLocalProvider(baseUrl, apiKey, api);
+  registerServer(
+    'providers:testLocal',
+    async (_e, _id: LocalProviderId, baseUrl: string, apiKey?: string, api?: LocalProviderApi, deviceId?: string | null) => {
+      if (deps.e2e) return { ok: true, models: ['stem-e2e-model'] };
+      return deviceId ? probeLocalProviderOn(deviceId, baseUrl, apiKey ?? undefined, api ?? undefined) : probeLocalProvider(baseUrl, apiKey, api);
+    }
+  );
+  registerServer('providers:localHealth', () => localProviderHealth());
+  // "Check again" in Settings: the same sync the 30s refresh runs, now, and the
+  // restart that makes pi see a changed list (deferred while a turn streams).
+  registerServer('providers:refreshLocal', async () => {
+    if (deps.e2e) return {};
+    await deps.runtime().refreshLocalModels?.();
+    return localProviderHealth();
   });
-  registerServer('providers:updateLocal', async (_e, id: LocalProviderId, patch: Partial<LocalProviderSettings>) => {
+  registerServer('providers:updateLocal', async (_e, id: LocalProviderId, patch: LocalProviderPatch) => {
     if (!isLocalProviderId(id)) return { ok: false, error: 'Invalid local provider id.' };
     // A named endpoint is only ever shown by its name, so one without a name
     // would be a row nobody can tell apart. The id shape itself was checked above.

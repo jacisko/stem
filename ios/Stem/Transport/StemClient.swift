@@ -83,6 +83,22 @@ struct StemClient: Sendable {
         return TurnAttachment(name: r.name, path: r.handle, dataBase64: nil, mime: mime)
     }
 
+    /// One file from GET /files/<rel>, saved under a temporary folder with its name.
+    func download(_ rel: String, name: String) async throws -> URL {
+        let encoded = rel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? rel
+        guard let url = URL(string: creds.serverUrl + "/files/" + encoded) else { throw StemError(message: "Bad file address") }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(creds.token)", forHTTPHeaderField: "Authorization")
+        let (data, status) = try await send(req)
+        guard (200..<300).contains(status) else { throw StemError(message: "Couldn't fetch \(name) (HTTP \(status))") }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let safe = name.replacingOccurrences(of: "/", with: "_")
+        let file = dir.appendingPathComponent(safe.isEmpty ? "file" : safe)
+        try data.write(to: file)
+        return file
+    }
+
     private func send(_ req: URLRequest) async throws -> (Data, Int) {
         do {
             let (data, resp) = try await Self.session.data(for: req)

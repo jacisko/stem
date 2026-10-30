@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
   AlertTriangle,
+  Bot,
   Code2,
   EyeOff,
   FileText,
@@ -24,7 +25,7 @@ import type {
 } from '../../../shared/types';
 import { resolveMemoryModel } from '../../../shared/modelRoles';
 import { useClientDeviceId, useRemoteServer } from '../../hooks/useRemoteServer';
-import { ConnectFolderWizard, KINDS } from '../ConnectFolderWizard';
+import { CLAUDE_KIND, ConnectFolderWizard, KINDS, claudeCodeAvailable } from '../ConnectFolderWizard';
 import {
   ConfirmDelete,
   DetailFooter,
@@ -246,7 +247,8 @@ const KIND_ICON: Record<ConnectedFolderKind, (size: number) => ReactNode> = {
   notes: (n) => <NotebookPen size={n} />,
   code: (n) => <Code2 size={n} />,
   docs: (n) => <FileText size={n} />,
-  private: (n) => <Lock size={n} />
+  private: (n) => <Lock size={n} />,
+  claude: (n) => <Bot size={n} />
 };
 
 function FolderGlyph({ kind, size = 'md', tone = 'plain' }: { kind?: ConnectedFolderKind | null; size?: 'sm' | 'md' | 'lg'; tone?: GlyphTone }) {
@@ -583,18 +585,23 @@ function ConnectedFoldersTab({ models }: { models: ModelSummary[] }) {
                 <select
                   id="cfolder-kind"
                   className="vfield"
+                  disabled={d.kind === 'claude'}
                   value={d.kind ?? ''}
                   onChange={(e) => setDraft({ ...d, kind: (e.target.value || null) as ConnectedFolderKind | null })}
                 >
                   <option value="">Not set</option>
-                  {KINDS.map((k) => (
+                  {(d.kind === 'claude' ? [CLAUDE_KIND, ...KINDS] : KINDS).map((k) => (
                     <option key={k.value} value={k.value}>
                       {k.label}
                     </option>
                   ))}
                 </select>
               </Field>
-              <p className="ld-hint">Sets the folder’s icon. It changes nothing else.</p>
+              <p className="ld-hint">
+                {d.kind === 'claude'
+                  ? 'Stem keeps this folder up to date from Claude Code on the computer it came from.'
+                  : 'Sets the folder’s icon. It changes nothing else.'}
+              </p>
               {f.origin && (
                 <div className="ld-stat">
                   <RefreshCw size={13} />
@@ -783,6 +790,14 @@ function ConnectedFoldersTab({ models }: { models: ModelSummary[] }) {
           )
         }
         templates={[
+          ...(claudeCodeAvailable() ? [CLAUDE_KIND] : []).map((k) => ({
+            key: k.value,
+            icon: KIND_ICON[k.value](12),
+            tone: 'plain' as GlyphTone,
+            label: k.label,
+            hint: 'Memory and sessions from this computer, no path needed',
+            onPick: () => setAdding({ kind: k.value })
+          })),
           ...KINDS.map((k) => ({
             key: k.value,
             icon: KIND_ICON[k.value](12),

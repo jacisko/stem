@@ -7,6 +7,7 @@ import {
   ipcMain,
   nativeImage,
   nativeTheme,
+  Notification,
   powerMonitor,
   session,
   shell
@@ -26,6 +27,7 @@ import { registerLocalIpc } from './local';
 import { createMcpHost, type McpHost } from './mcp-host';
 import { createExecHost, type ExecHost } from './exec-host';
 import { createDesktopHarnessHost, type DesktopHarnessHost } from './harness-host';
+import { createLlmHost, type LlmHost } from './llm-host';
 import { createComputerHost, type ComputerHost } from './computer-host';
 import { createRecorder, type Recorder } from './recorder';
 import { createComputerBanner } from './computer-host/banner';
@@ -33,6 +35,8 @@ import { createBrowserHost, type BrowserHost } from './browser-host';
 import { downloadFile, uploadFile } from './file-transfer';
 import { BROWSER_EXTENSION_DIR, BROWSER_NATIVE_HOST_SCRIPT } from './renderer-assets';
 import { createMirrorHost, type MirrorHost } from './mirror-host';
+import { readMirroredFolders } from './mirror-host/store';
+import { createClaudeExportHost, type ClaudeExportHost } from './claude-export';
 import { createOAuthCourier, type OAuthCourier } from './oauth-courier';
 import { enableGlobalShortcutPortal, isLinux, isMac, mainWindowChromeOptions, requestAttention, timeLocaleArguments } from './platform';
 import { createPresenceHeartbeat, type PresenceHeartbeat } from './presence';
@@ -45,7 +49,7 @@ import { createQuickChat } from './quickchat';
 import { loadRenderer, PRELOAD_SCRIPT } from './renderer-assets';
 import { initTray } from './tray';
 import { RendererPushQueue } from './ui-lifecycle';
-import type { AppSettings, MenuCommand, ThemeState } from '../shared/types';
+import type { AppSettings, ConnectedFolder, MenuCommand, ThemeState } from '../shared/types';
 
 // The Electron main process: windows, tray, the global shortcut, and app
 // lifecycle. It owns nothing about chats, memory, skills or settings — it starts
@@ -309,6 +313,24 @@ function liveQuickChatAccelerator(): string | null {
   return status.registered ? status.accelerator : null;
 }
 
+/**
+ * Another person's mail arrived: a system notification naming them, unless
+ * Stem is in front already (the Inbox shows it). Clicking opens it.
+ */
+function notifyPersonMail(mail: { conversationId: string; from: string; name?: string; subject?: string; joined?: boolean }): void {
+  if (E2E || !Notification.isSupported()) return;
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return;
+  const who = mail.name ? `${mail.name} (${mail.from})` : mail.from;
+  const n = mail.joined
+    ? new Notification({ title: `${who} is on Stem now`, body: 'Your mail to them is ready to send.' })
+    : new Notification({ title: who, body: mail.subject ? mail.subject : 'Wrote to you on Stem.' });
+  n.on('click', () => {
+    revealMainWindow();
+    sendToMain('mail:openConversation', { conversationId: mail.conversationId });
+  });
+  n.show();
+}
+
 /** Bring the main window to the front (recreating it if it was closed). */
 function revealMainWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
@@ -421,10 +443,12 @@ let presence: PresenceHeartbeat | null = null;
 let mcpHost: McpHost | null = null;
 let execHost: ExecHost | null = null;
 let harnessHost: DesktopHarnessHost | null = null;
+let llmHost: LlmHost | null = null;
 let computerHost: ComputerHost | null = null;
 let recorder: Recorder | null = null;
 let browserHost: BrowserHost | null = null;
 let mirrorHost: MirrorHost | null = null;
+let claudeExport: ClaudeExportHost | null = null;
 
 /**
  * Whether the server is answering, as last reported by the proxy. Kept here
@@ -434,6 +458,12 @@ let mirrorHost: MirrorHost | null = null;
  * windows ask (`client:connection`) and are then told (`client:connectionChanged`).
  */
 let serverReachable = true;
+
+const CLIENT_VERSION_REPORT_MS = 6 * 60 * 60 * 1000;
+
+function reportClientVersion(): void {
+  void proxy?.invoke('serverUpgrade:status', [app.getVersion()]).catch(() => undefined);
+}
 
 app.whenReady().then(async () => {
   // Strict CSP for the renderer in production: only self, no remote/inline
@@ -540,6 +570,16 @@ app.whenReady().then(async () => {
         creds: () => endpoint
       });
 
+  // The "Claude Code" folder's converted copy (see desktop/claude-export/): it
+  // runs while that copy is connected — mirrored from here against a remote
+  // server, or connected directly when the server is this process.
+  claudeExport = createClaudeExportHost({
+    isConnected: async (outDir) =>
+      server
+        ? ((await proxy!.invoke('cfolders:list', [])) as ConnectedFolder[]).some((f) => f.path === outDir)
+        : (await readMirroredFolders()).some((f) => f.clientPath === outDir)
+  });
+
   execHost = createExecHost({
     invoke: (channel, args) => proxy!.invoke(channel, args),
     // A device command may have written into a mirrored folder; push it now so
@@ -552,6 +592,11 @@ app.whenReady().then(async () => {
   harnessHost = createDesktopHarnessHost({
     invoke: (channel, args) => proxy!.invoke(channel, args)
   });
+
+  // The model servers (LM Studio, Ollama, …) a provider in Settings says run on
+  // THIS computer. No switch: it only reaches this machine's own network, and
+  // only the model-API paths (see llm-host/index.ts).
+  llmHost = createLlmHost({ invoke: (channel, args) => proxy!.invoke(channel, args) });
 
   // The screen actions the server addresses to THIS Mac (a persona's
   // `computer` tool). Same posture as the hosts above: off until the switch
@@ -607,6 +652,7 @@ app.whenReady().then(async () => {
     harnessHost,
     computerHost,
     browserHost,
+    llmHost,
     mirrorFoldersChanged: () => void mirrorHost?.foldersChanged(),
     sendToMain,
     sendToOverlay: (channel, payload) => quickChat.sendToOverlay(channel, payload),
@@ -619,6 +665,7 @@ app.whenReady().then(async () => {
     turnAbandoned: (turnId) => quickChat.abandonHudTurn(turnId),
     revealMainWindow,
     requestAttention: () => requestAttention(mainWindow),
+    notifyPersonMail,
     threadOpened: (threadId) => quickChat.threadOpened(threadId),
     applyQuickChatSettings: (patch, next) => {
       quickChat.applySettings(patch, next);
@@ -632,6 +679,7 @@ app.whenReady().then(async () => {
     // on the push queue's path (it is created up front and only ever hidden), so
     // it is sent to directly.
     connection: (reachable) => {
+      if (reachable && !serverReachable && !server) reportClientVersion();
       serverReachable = reachable;
       sendToMain('client:connectionChanged', reachable);
       quickChat.sendToOverlay('client:connectionChanged', reachable);
@@ -650,6 +698,7 @@ app.whenReady().then(async () => {
       // And reconcile + rescan the mirrored folders: edits made while the
       // stream was down are exactly what a reconnect has to catch up on.
       if (reachable) void mirrorHost?.refresh();
+      if (reachable) void claudeExport?.refresh();
       // And write up a recording a quit or crash left behind on this Mac.
       if (reachable) void recorder?.recover();
     }
@@ -685,6 +734,7 @@ app.whenReady().then(async () => {
     browserHost,
     recorder,
     mirrorHost,
+    claudeExport: claudeExport!,
     themeChanged
   });
   // A theme file saved, added or removed in the themes folder is the same event
@@ -708,6 +758,14 @@ app.whenReady().then(async () => {
     for (const { channel, payload } of mainPushQueue.markReady()) win.webContents.send(channel, payload);
   });
   bindServerChannels(channels, (channel, args) => proxy!.invoke(channel, args));
+  // A remote server upgrades itself to the newest client version it hears of
+  // (server/upgrade.ts), so tell it ours: now, on every reconnect, and now and
+  // then for a server that never drops. A server too old to know the channel
+  // refuses it, and that server is upgraded by hand.
+  if (!server) {
+    reportClientVersion();
+    setInterval(reportClientVersion, CLIENT_VERSION_REPORT_MS).unref();
+  }
 
   const settings = (await proxy.invoke('settings:get', [])) as AppSettings;
   // An install that has not been set up yet is owed no release notes: whatever
@@ -744,6 +802,7 @@ app.whenReady().then(async () => {
     void computerHost?.start();
     void browserHost?.start();
     void mirrorHost?.start();
+    void claudeExport?.refresh();
   });
 
   quickChat.start(settings.quickChat);
@@ -803,12 +862,14 @@ app.on('before-quit', (event) => {
   // Same argument for a coding agent's adapter processes: cancel gracefully and
   // close; the sessions themselves survive on this disk.
   void harnessHost?.close();
+  llmHost?.close();
   // And a screen run: the helper is a child of this process too.
   computerHost?.close();
   // And the browser host's socket: the extension's native host retries until Stem is back.
   browserHost?.close();
   // And a recording in progress: its helper is a child too; its folder stays for recover().
   recorder?.close();
+  claudeExport?.close();
   // And the "Ask about this window" helper.
   quickChat.stop();
   // Nothing to drain when the server is somebody else's process.

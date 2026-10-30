@@ -1154,6 +1154,15 @@ button.primary:disabled { opacity: 0.55; cursor: default; }
 .dictate.listening:hover { background: color-mix(in srgb, var(--danger) 18%, transparent); }
 .dictate.failed { color: var(--danger); }
 @media (prefers-reduced-motion: reduce) { .dictate .spin { animation: none; } }
+/* Voice chat (chat/voice.tsx): accent while a call is live; it breathes
+   while either side is talking and while Stem works on a request. */
+.voice .spin { animation: link-btn-spin 0.9s linear infinite; }
+.voice.live { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.voice.live:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.voice.live.hearing, .voice.live.speaking, .voice.live.working { animation: voice-breathe 1.4s ease-in-out infinite; }
+.voice.failed { color: var(--danger); }
+@keyframes voice-breathe { 50% { background: color-mix(in srgb, var(--accent) 28%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .voice .spin, .voice.live { animation: none !important; } }
 
 .icon-btn {
   position: relative;
@@ -3298,6 +3307,12 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
   color: var(--accent);
 }
 .hud-pill.finished { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.hud-wait {
+  display: inline-flex;
+  flex: none;
+  color: var(--warn);
+}
+.hud-pill.waiting { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
 .hud-hint {
   flex: none;
   margin-left: var(--sp-1);
@@ -3482,7 +3497,7 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
    delete (hover/focus only) so it is never the obvious thing to click. */
 .files-group-head .grp-head-add { opacity: 0; transition: opacity var(--motion-fast) ease; }
 .files-group-head:hover .grp-head-add, .files-group-head .grp-head-add:focus-visible { opacity: 1; }
-/* The group name is the fold toggle; the count shows only while folded. */
+/* The group name is the fold toggle; count, size and last change sit beside it. */
 .files-group-toggle {
   display: inline-flex; align-items: center; gap: var(--sp-2);
   min-width: 0; padding: 0; border: 0; background: none;
@@ -3502,6 +3517,8 @@ body.platform-win32 .hud-pill { background: color-mix(in srgb, var(--surface) 94
 .files-row .row-action { opacity: 0; transition: opacity var(--motion-fast) ease; }
 .files-row:hover .row-action, .files-row .row-action:focus-visible { opacity: 1; }
 .files-foot { margin: var(--sp-5) var(--sp-2) 0; }
+.files-sort { display: flex; justify-content: flex-end; margin: 0 var(--sp-2) var(--sp-3); }
+.files-sort .vfield { width: auto; }
 
 /* ---- Connected folders (Sources tab → Connected folders sub-tab) ---- */
 .cfolders-head { display: flex; align-items: center; justify-content: space-between; }
@@ -3982,7 +3999,7 @@ summary.mail-work-action { cursor: pointer; }
 /* The update's call to action sits between the scrolling notes and the buttons:
    read after the notes, never scrolled past, and visually a note rather than a
    fourth button. */
-/* "Beta" beside a feature that ships but is still changing (personas, mail).
+/* "Beta" beside a feature that ships but is still changing (personas, mail to people).
    aria-hidden where it sits inside a control, so the control's name stays the
    word people (and tests) know it by; the explanation rides on the title. */
 .beta-pill { display: inline-block; margin-left: var(--sp-3); padding: 1px var(--sp-3); border-radius: var(--radius-pill); font-size: var(--fs-10); font-weight: 600; letter-spacing: 0.02em; text-transform: none; vertical-align: 1px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
@@ -4525,7 +4542,6 @@ select.vfield:focus { outline: none; border-radius: var(--radius-sm); box-shadow
   text-align: left;
 }
 .prov-tile:hover { background: color-mix(in srgb, var(--ink) 4%, var(--surface)); }
-.prov-tile.selected { background: var(--sel); border-color: var(--accent); }
 .prov-tile-head { display: flex; align-items: center; justify-content: space-between; }
 .prov-tile b { font-size: var(--fs-13); font-weight: 600; display: block; }
 .prov-tile i {
@@ -4561,7 +4577,12 @@ select.vfield:focus { outline: none; border-radius: var(--radius-sm); box-shadow
 .prov-dot { width: 8px; height: 8px; border-radius: var(--radius-pill); flex: none; }
 .prov-dot.ok { background: var(--success); }
 .prov-dot.bad { background: var(--danger); }
-.prov-actions { display: flex; gap: var(--sp-5); margin-top: var(--sp-4); padding: 0 var(--sp-1); }
+.prov-dot.unknown { background: var(--muted); }
+/* A provider's page (Settings → Models → a tile): the Manage editor's header over settings rows. */
+.prov-detail { display: flex; flex-direction: column; gap: var(--sp-5); margin-bottom: var(--sp-5); }
+.set-vrow .vval .prov-dot { display: inline-block; width: 6px; height: 6px; vertical-align: 1px; margin-right: 2px; }
+.set-vrow .vval.mono, .set-vbody .mono { font-family: var(--font-mono); font-size: var(--fs-11); }
+.set-vbody .mono { color: var(--muted); overflow-wrap: anywhere; }
 
 /* The lead-the-tab banner (a dead provider sign-in). */
 .set-banner {
@@ -5092,3 +5113,29 @@ select.vfield:focus { outline: none; border-radius: var(--radius-sm); box-shadow
 /* MCP editor: what is left to do for an official server filled in from the catalog. */
 .mcp-guide { display: grid; gap: var(--sp-2); }
 .mcp-guide p { margin: 0; }
+/* Person mail: To field with the "on Stem?" check, send states, header name. */
+.mail-person-to { flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); min-width: 0; }
+.mail-person-to input { flex: 1 1 14rem; }
+.mail-person-name { font-size: var(--fs-12); color: var(--muted); }
+.mail-person-reach { flex-basis: 100%; display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); margin: 0; font-size: var(--fs-12); color: var(--muted); }
+.mail-person-reach.reachable { color: var(--success); }
+.mail-person-reach.self, .mail-person-reach.blocked, .mail-person-reach.refused { color: var(--danger); }
+.mail-ext-sendstate { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3); }
+.mail-ext-sendstate > span { flex: 1 1 14rem; }
+.mail-ext-sendstate.ready { color: var(--success); }
+.mail-ext-status.waiting { color: var(--warn); }
+.mail-ext-status.joined { color: var(--success); }
+.mail-ext-who { display: inline-flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); }
+.mail-ext-rename { font: inherit; padding: 0 var(--sp-2); border: 0.5px solid var(--accent); border-radius: var(--radius-sm); background: transparent; color: inherit; width: 12rem; }
+.icon-action.on { color: var(--accent); }
+/* Person mail: where the collaboration stands. */
+.mail-collab { margin: 0 var(--sp-10); margin-top: var(--sp-3); border: 0.5px solid var(--hair); border-radius: var(--radius-md); background: var(--sel); font-size: var(--fs-12); color: var(--ink); }
+.mail-collab-head { display: flex; align-items: center; gap: var(--sp-3); width: 100%; padding: var(--sp-3) var(--sp-4); border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.mail-collab-head strong { flex: 1; min-width: 0; }
+.mail-collab-turn { white-space: nowrap; font-size: var(--fs-11); color: var(--muted); }
+.mail-collab-turn.you { color: var(--accent); font-weight: 600; }
+.mail-collab-body { display: grid; gap: var(--sp-2); padding: 0 var(--sp-4) var(--sp-3); }
+.mail-collab-body ul { margin: var(--sp-1) 0 0; padding-left: var(--sp-5); }
+.mail-collab-body li { margin: 2px 0; }
+.mail-collab-body p { margin: 0; }
+.mail-collab-label { font-size: var(--fs-11); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }

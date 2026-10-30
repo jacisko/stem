@@ -19,6 +19,7 @@ import type {
   LocalModelDtype,
   LocalProviderApi,
   LocalProviderId,
+  LocalProviderPatch,
   LocalProviderSettings,
   LocalProvidersSettings,
   LocalRerankModelId,
@@ -145,7 +146,9 @@ const DEFAULTS: ServerSettings = {
     browser: { allow: false, target: null },
     // Image generation: ON for every chat, persona and run with a ChatGPT
     // sign-in until switched off (2026-09-28).
-    images: { allow: true }
+    images: { allow: true },
+    // Voice chat: ON with a ChatGPT sign-in, like images (2026-10-25).
+    voice: { allow: true }
   },
   // Embeddings + reranker for relevance-ranking facts at inject time. Embeddings
   // default to the bundled local model (multilingual, in-process, nothing leaves
@@ -642,6 +645,9 @@ function coerce(parsed: Partial<ServerSettings> | null): ServerSettings {
       custom && isRecord(rawOverrides)
         ? Object.fromEntries(Object.entries(rawOverrides).filter(([k, v]) => k.trim() && isRecord(v)))
         : {};
+    // Whether that id names a paired computer is the relay's question, asked on
+    // every request — an unpaired one is refused there with a sentence, not here.
+    const deviceId = isRecord(r.location) && typeof r.location.deviceId === 'string' ? r.location.deviceId.trim() : '';
     return {
       ...(custom && typeof r.name === 'string' && r.name.trim() ? { name: r.name.trim().slice(0, 80) } : {}),
       enabled: typeof r.enabled === 'boolean' ? r.enabled : def.enabled,
@@ -649,7 +655,8 @@ function coerce(parsed: Partial<ServerSettings> | null): ServerSettings {
       ...(api ? { api } : {}),
       ...(apiKey ? { apiKey } : {}),
       ...(models.length ? { models } : {}),
-      ...(Object.keys(overrides).length ? { modelOverrides: overrides } : {})
+      ...(Object.keys(overrides).length ? { modelOverrides: overrides } : {}),
+      ...(deviceId ? { location: { deviceId } } : {})
     };
   };
   const localProviders: LocalProvidersSettings = {
@@ -720,7 +727,8 @@ function coerceChatFeatures(raw: unknown): ChatFeatureSettings {
       allow: browser.allow === true,
       target: browserDevice ? { device: browserDevice, ...(browserProfiles ? { profiles: browserProfiles } : {}) } : null
     },
-    images: { allow: obj(r.images).allow !== false }
+    images: { allow: obj(r.images).allow !== false },
+    voice: { allow: obj(r.voice).allow !== false }
   };
 }
 
@@ -1034,7 +1042,7 @@ export async function skillsRunOf(): Promise<RoleRun> {
 }
 
 /** Patch one local provider (Ollama / LM Studio / custom) and persist; returns the full settings. */
-export function updateLocalProvider(id: LocalProviderId, patch: Partial<LocalProviderSettings>): Promise<ServerSettings> {
+export function updateLocalProvider(id: LocalProviderId, patch: LocalProviderPatch): Promise<ServerSettings> {
   return enqueue(async () => {
     const cur = await readForUpdate();
     const next = coerce({

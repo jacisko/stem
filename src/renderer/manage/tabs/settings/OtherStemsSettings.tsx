@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { Check, ShieldCheck, Trash2, UserX } from 'lucide-react';
+import { BrainCircuit, Check, Pencil, ShieldCheck, Sparkles, Trash2, UserX } from 'lucide-react';
 import { InfoTip } from '../../../ui/InfoTip';
 import { DisclosureRow, ValueRow } from './rows';
 import { formatFingerprint, useInterStem } from '../../../mail/useInterStem';
+import { PERSON_MAIL_BETA_TITLE } from '../../../chats/ChatList';
 
 /**
  * Settings → Features → Your email address: the verified addresses this Stem
@@ -13,6 +14,9 @@ export function OtherStemsSection() {
   const { status } = useInterStem();
   const [address, setAddress] = useState('');
   const [codes, setCodes] = useState<Record<string, string>>({});
+  const [naming, setNaming] = useState<{ address: string; name: string } | null>(null);
+  // Forget what Stem learned from mail with someone: asked once, with the count.
+  const [forgetting, setForgetting] = useState<{ address: string; facts: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,7 +37,12 @@ export function OtherStemsSection() {
   if (status.policy?.mode === 'off') {
     return (
       <>
-        <div className="grp-head">Your email address</div>
+        <div className="grp-head">
+        Your email address
+        <span className="beta-pill" title={PERSON_MAIL_BETA_TITLE}>
+          Beta
+        </span>
+      </div>
         <div className="group">
           <ValueRow label="Turned off by your organization" hint="No mail with other Stems and no public links" />
         </div>
@@ -48,7 +57,12 @@ export function OtherStemsSection() {
 
   return (
     <>
-      <div className="grp-head">Your email address</div>
+      <div className="grp-head">
+        Your email address
+        <span className="beta-pill" title={PERSON_MAIL_BETA_TITLE}>
+          Beta
+        </span>
+      </div>
       <div className="group">
         {allowed && (
           <ValueRow
@@ -170,14 +184,68 @@ export function OtherStemsSection() {
             {contacts.map((c) => (
               <ValueRow
                 key={c.address}
-                label={c.address}
+                label={
+                  naming?.address === c.address ? (
+                    <input
+                      className="mail-ext-rename"
+                      value={naming.name}
+                      autoFocus
+                      placeholder="Their name"
+                      aria-label={`Name for ${c.address}`}
+                      onChange={(e) => setNaming({ address: c.address, name: e.target.value })}
+                      onBlur={() => {
+                        const next = naming.name;
+                        setNaming(null);
+                        if (next.trim() !== (c.name ?? '')) void run(() => window.stem.interStemSetContact(c.address, { name: next }));
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
+                      }}
+                    />
+                  ) : (
+                    c.name ?? c.address
+                  )
+                }
                 hint={
                   c.keyChanged
                     ? 'Their key changed — check before writing'
-                    : `${c.state === 'request' ? 'Request · ' : ''}${c.verifiedByUser ? 'Verified by you' : 'Verified by email'} · ${formatFingerprint(c.keyFp)}`
+                    : [
+                        c.name ? c.address : null,
+                        c.state === 'request' ? 'Request' : null,
+                        c.verifiedByUser ? 'Verified by you' : c.keyFp ? 'Verified by email' : 'Not written yet',
+                        c.autoDraft ? 'Auto-draft on' : null,
+                        c.keyFp ? formatFingerprint(c.keyFp) : null
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')
                 }
               >
                 <span className="row-inline">
+                  <button
+                    className="icon-action sm"
+                    disabled={busy}
+                    title={c.name ? 'Rename' : 'Give them a name'}
+                    aria-label={`Name ${c.address}`}
+                    onClick={() => setNaming({ address: c.address, name: c.name ?? '' })}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button
+                    className={`icon-action sm${c.autoDraft ? ' on' : ''}`}
+                    disabled={busy || !c.verifiedByUser}
+                    aria-pressed={!!c.autoDraft}
+                    title={
+                      !c.verifiedByUser
+                        ? 'Auto-draft needs a key you checked with them in person (the shield)'
+                        : c.autoDraft
+                          ? 'Auto-draft is on: their mail is read by your agents at once and a draft waits for you. Click to turn off.'
+                          : 'Auto-draft: when they write, your agents read it and draft a reply for you to send'
+                    }
+                    aria-label={`Auto-draft for ${c.address}`}
+                    onClick={() => void run(() => window.stem.interStemSetContact(c.address, { autoDraft: !c.autoDraft }))}
+                  >
+                    <Sparkles size={14} />
+                  </button>
                   <button
                     className="icon-action sm"
                     disabled={busy}
@@ -187,6 +255,37 @@ export function OtherStemsSection() {
                   >
                     <ShieldCheck size={14} />
                   </button>
+                  {forgetting?.address === c.address ? (
+                    <span className="row-inline">
+                      {forgetting.facts === 0 ? (
+                        <span className="muted">Nothing learned yet</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="push danger"
+                          disabled={busy}
+                          onClick={() => void run(() => window.stem.interStemForgetContact(c.address)).then(() => setForgetting(null))}
+                        >
+                          Forget {forgetting.facts} {forgetting.facts === 1 ? 'fact' : 'facts'}
+                        </button>
+                      )}
+                      <button type="button" className="push" onClick={() => setForgetting(null)}>
+                        {forgetting.facts === 0 ? 'OK' : 'Keep'}
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      className="icon-action sm"
+                      disabled={busy}
+                      title="What Stem learned from mail with them (used only when you write with them) — forget it"
+                      aria-label={`Forget what Stem learned from ${c.address}`}
+                      onClick={() =>
+                        void run(async () => setForgetting({ address: c.address, facts: (await window.stem.interStemContactMemory(c.address)).facts }))
+                      }
+                    >
+                      <BrainCircuit size={14} />
+                    </button>
+                  )}
                   <button
                     className="icon-action sm"
                     disabled={busy}

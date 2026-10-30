@@ -26,6 +26,7 @@ import type { Recorder } from '../recorder';
 import type { BrowserHostLocalState } from '../../shared/types';
 import type { HarnessHostLocalState } from '../../shared/types';
 import type { MirrorFolderLocalState, MirrorHost } from '../mirror-host';
+import type { ClaudeExportHost } from '../claude-export';
 import type { Updates } from '../updates';
 import type {
   AppSettings,
@@ -108,6 +109,8 @@ export interface LocalIpcDeps {
    * directly then, and mirroring it to itself would be a copy with no purpose.
    */
   mirrorHost: MirrorHost | null;
+  /** The "Claude Code" folder's converted copy on this machine (see desktop/claude-export/). */
+  claudeExport: ClaudeExportHost;
   /** The theme changed: push the new state to all three windows at once. */
   themeChanged(state: ThemeState): void;
 }
@@ -319,6 +322,14 @@ export function registerLocalIpc(deps: LocalIpcDeps): void {
       throw new Error('Stem could not read that folder.');
     })
   );
+  // The "Claude Code" folder: no path to pick, because it is always this
+  // machine's own Claude Code data. Fills the converted copy and answers where
+  // it is; the wizard then connects that path the usual way (mirrored against
+  // a remote server, directly on a single machine).
+  handleLocal('claude:prepareLocal', async () => {
+    await deps.claudeExport.prepare();
+    return { path: deps.claudeExport.outDir, label: deps.claudeExport.label(!!deps.mirrorHost) };
+  });
   handleLocal('mirror:localState', (): MirrorFolderLocalState[] => deps.mirrorHost?.localState() ?? []);
 
   // A link clicked in a chat message (file: ones cannot ride window.open — see

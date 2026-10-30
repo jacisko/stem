@@ -63,8 +63,12 @@ not on top of it, with a chip showing which window it captured. She asks
 - The panel sits right of the window, else left, else below or above. It covers
   the window only when the window fills the screen. It follows the window if you
   move it.
-- Pressing it again in the same window continues that conversation. In another
-  window it starts a new one.
+- Every window gets its own panel and its own conversation, so you can ask
+  about several windows at once: asking about a second window leaves the
+  first one's panel open, and both can be answering at the same time.
+- Pressing it in a window whose panel is open puts you back in that panel;
+  pressing it while typing in a panel closes that one. Pressing it again in a
+  window you asked about earlier continues that window's conversation.
 - On a Mac it needs **Screen Recording** for the picture and **Accessibility**
   for the text. If one is off, the chip says which and opens the right System
   Settings pane. On Windows it needs no setup. On Linux it needs the GNOME

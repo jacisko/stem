@@ -17,6 +17,7 @@ const BROWSER_IDS = new Set(
     'com.vivaldi.Vivaldi',
     'com.operasoftware.Opera',
     'net.imput.helium',
+    'sk.awantech.jbrow',
     // Windows exe names
     'chrome',
     'msedge',
@@ -47,7 +48,7 @@ const BROWSER_IDS = new Set(
 );
 
 /** An app name, when the window came without an id. */
-const BROWSER_NAME = /^(google chrome|chromium|arc|dia|brave( browser)?|microsoft edge|vivaldi|opera|helium|thorium)\b/i;
+const BROWSER_NAME = /^(google chrome|chromium|arc|dia|brave( browser)?|microsoft edge|vivaldi|opera|helium|thorium|jbrow)\b/i;
 
 /** Whether a window of this app is a browser the `browser` tool can drive. */
 export function isBrowserApp(app: string, bundleId: string | null): boolean {

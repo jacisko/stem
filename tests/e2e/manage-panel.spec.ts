@@ -187,3 +187,51 @@ test('a connected folder saves its edits on Save, and New opens the wizard with 
     removeUserData(dir);
   }
 });
+
+test('Claude Code connects from the wizard without a path and fills the folder', async () => {
+  // A fixture ~/.claude: one session and one memory note. Cowork is pointed at
+  // nothing so the run never reads this machine's real Claude app data.
+  const claudeDir = mkdtempSync(join(tmpdir(), 'stem-e2e-claude-'));
+  const project = join(claudeDir, 'projects', '-work-app');
+  mkdirSync(join(project, 'memory'), { recursive: true });
+  writeFileSync(
+    join(project, 'aaaaaaaa-1111.jsonl'),
+    [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Plan the release' }, timestamp: '2026-10-19T15:07:00Z', cwd: '/work/app' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Sure.' }] }, timestamp: '2026-10-19T15:08:00Z' })
+    ].join('\n')
+  );
+  writeFileSync(join(project, 'memory', 'tabs.md'), '---\nname: tabs\ntype: user\n---\nThe user prefers tabs.');
+  const { app, userDataDir } = await launchApp({
+    env: { CLAUDE_CONFIG_DIR: claudeDir, STEM_CLAUDE_COWORK_DIR: join(claudeDir, 'no-cowork') }
+  });
+  try {
+    const win = await mainWindowOf(app);
+    await win.waitForLoadState('domcontentloaded');
+    await win.getByRole('button', { name: 'Sources — files & connected folders' }).click();
+    await win.getByRole('button', { name: 'Connected folders', exact: true }).click();
+    await win.getByRole('button', { name: 'Add folder' }).click();
+    await win.getByRole('menuitem', { name: /Claude Code/ }).click();
+
+    const wizard = win.getByRole('dialog', { name: 'Connect a folder' });
+    await expect(wizard.getByLabel('Folder path')).toHaveCount(0);
+    await expect(wizard.getByLabel('Folder name')).toHaveValue('Claude Code');
+    await wizard.getByRole('button', { name: 'Next' }).click();
+    // Access is skipped: the copy is always read-only.
+    await expect(wizard.getByText('Should Stem remember what it reads here?')).toBeVisible();
+    await wizard.getByRole('button', { name: 'Connect' }).click();
+    await expect(wizard).toHaveCount(0);
+
+    const folder = () =>
+      win.evaluate(() => (window as any).stem.listConnectedFolders().then((l: any[]) => l.find((f) => f.kind === 'claude')));
+    await expect.poll(folder).toMatchObject({ label: 'Claude Code', mode: 'read', memorize: true, index: true, kind: 'claude' });
+    const path = (await folder()).path as string;
+    const written = (readdirSync(path, { recursive: true }) as string[]).map((f) => f.split('\\').join('/')).sort();
+    expect(written).toContain('memory/user/work-app/tabs.md');
+    expect(written).toContain('sessions/work-app/2026-10-19-plan-the-release-aaaaaaaa.md');
+  } finally {
+    await app.close();
+    removeUserData(userDataDir);
+    removeUserData(claudeDir);
+  }
+});

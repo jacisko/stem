@@ -14,6 +14,8 @@ import { recordDecision, type DecisionOutcome } from './decisions';
 import { degrade } from '../degrade';
 import { log } from '../log';
 import { ensureThreadScratch } from './scratch';
+import { findNewBulky } from '../files/bulky';
+import { filesRoot } from '../workspace/paths';
 import { clampTimeout, execEnv, resolveLoginPath, runCommand, timedOutLine } from './executor';
 import { gitBashPathEnv, resolveHostShellTarget, type HostShellTarget } from './git-bash';
 import { SafetyJudge } from './judge';
@@ -717,6 +719,9 @@ export class ExecService implements ExecBridge {
     try {
       const { shell, gitBashPath } = host;
       const loginPath = await resolveLoginPath();
+      // A second back, so a folder filled in the same clock tick the command
+      // started still counts as this command's (mtime resolution varies by fs).
+      const startedMs = Date.now() - 1_000;
       const pathForChild =
         shell === 'git-bash' && gitBashPath ? gitBashPathEnv(gitBashPath, loginPath) : loginPath;
       const outcome = await runCommand({
@@ -738,6 +743,8 @@ export class ExecService implements ExecBridge {
         `stdout:\n${outcome.stdout.trim() || '(no output)'}`,
         `stderr:\n${outcome.stderr.trim() || '(no output)'}`
       ];
+      const note = await bulkyNote(startedMs);
+      if (note) parts.push(note);
       return { ok: true, text: parts.join('\n\n') };
     } catch (e) {
       // quiet: the message is the tool result — the assistant is told in the same
@@ -762,6 +769,24 @@ export class ExecService implements ExecBridge {
     if (next) next();
     else this.active -= 1;
   }
+}
+
+/**
+ * The backstop for the system prompt's "work in scratch" rule: when a command
+ * just made a virtualenv or node_modules inside the Files place, the result says
+ * so while the assistant can still move it. Files is never cleared, so this is
+ * the last point where nobody has to clean it up by hand (files/bulky.ts).
+ */
+async function bulkyNote(sinceMs: number): Promise<string | null> {
+  // quiet: a hint on top of a command that already ran; without it the result is still whole.
+  const found = await findNewBulky(filesRoot(), sinceMs).catch(() => []);
+  if (found.length === 0) return null;
+  const list = found.map((f) => `files/${f.rel} (${f.kind})`).join(', ');
+  return (
+    `Note: this command put tooling into the user's Files place: ${list}. Files is for finished ` +
+    'deliverables and is never cleared. Move that work into your scratch folder (or delete it if ' +
+    'it is not needed), and keep only the finished result in files/.'
+  );
 }
 
 /** The judge's side of a decision-log record. */

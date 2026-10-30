@@ -1,12 +1,13 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { chmod, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { host } from '../../server/host';
-import { BROWSER_EXTENSION_ID, BROWSER_NATIVE_HOST } from '../../shared/browser-native';
+import { BROWSER_EXTENSION_ID, BROWSER_NATIVE_HOST, sandboxOf, sandboxedBrowserName } from '../../shared/browser-native';
 import type { SetupBrowser } from '../../shared/types';
+import { inSandboxDir, relayKey, removeInSandbox, relayScript, sandboxRoot } from './relay';
 
 // Putting the Stem extension within reach of the user's browsers: the files to
 // Load unpacked, the native-messaging host the extension talks to, and the
@@ -26,6 +27,10 @@ import type { SetupBrowser } from '../../shared/types';
 // file in the state folder, and a key per browser under HKCU pointing at it. Startup refreshes them
 // only when they already point at this profile's wrapper, so an isolated dev
 // instance (STEM_PROFILE) never takes over the real install by being launched.
+//
+// A Snap or Flatpak browser cannot run that wrapper. Its manifest points at a
+// relay inside the browser's own folder instead (relay.ts), beside its own
+// copy of the extension, both kept up to date the same way.
 
 export interface BrowserInstallPaths {
   stateDir: string;
@@ -42,6 +47,15 @@ export interface BrowserHostConfig {
   socketPath: string;
   token: string;
   spoolDir: string;
+  /** The loopback port sandboxed browsers' relays reach Stem on (relay.ts). Kept, so the relays stay right. */
+  relayPort: number;
+  /** What each relay's own key is derived from (relay.ts relayKey); never leaves this folder. */
+  relaySecret: string;
+}
+
+/** A port for the relays, out of the range Linux hands out for outgoing connections. */
+export function newRelayPort(): number {
+  return 20_000 + (randomBytes(2).readUInt16LE(0) % 12_000);
 }
 
 export function browserInstallPaths(stateRoot = host().stateRoot(), platform: NodeJS.Platform = process.platform): BrowserInstallPaths {
@@ -78,17 +92,38 @@ export async function ensureHostConfig(paths = browserInstallPaths()): Promise<B
   try {
     const parsed = JSON.parse(await readFile(paths.configPath, 'utf8')) as Partial<BrowserHostConfig>;
     if (typeof parsed.token === 'string' && parsed.token.length >= 32 && typeof parsed.socketPath === 'string') {
-      return { socketPath: parsed.socketPath, token: parsed.token, spoolDir: paths.spoolDir };
+      const config = {
+        socketPath: parsed.socketPath,
+        token: parsed.token,
+        spoolDir: paths.spoolDir,
+        relayPort: parsed.relayPort ?? 0,
+        relaySecret: parsed.relaySecret ?? ''
+      };
+      const portOk = Number.isInteger(config.relayPort) && config.relayPort > 0 && config.relayPort < 65_536;
+      const secretOk = typeof config.relaySecret === 'string' && /^[0-9a-f]{64}$/.test(config.relaySecret);
+      if (portOk && secretOk) return config;
+      // A config from before the relays: the same token, and what the relays need added.
+      return writeHostConfig(paths, {
+        ...config,
+        relayPort: portOk ? config.relayPort : newRelayPort(),
+        relaySecret: secretOk ? config.relaySecret : randomBytes(32).toString('hex')
+      });
     }
   } catch {
     // quiet: absent or unreadable — written fresh below, which only costs a
     // re-run of the native host's handshake.
   }
-  const config: BrowserHostConfig = {
+  return writeHostConfig(paths, {
     socketPath: socketPathFor(paths.stateDir),
     token: randomBytes(32).toString('hex'),
-    spoolDir: paths.spoolDir
-  };
+    spoolDir: paths.spoolDir,
+    relayPort: newRelayPort(),
+    relaySecret: randomBytes(32).toString('hex')
+  });
+}
+
+/** Write the config (0600); the relay port changes this way when another program took it. */
+export async function writeHostConfig(paths: BrowserInstallPaths, config: BrowserHostConfig): Promise<BrowserHostConfig> {
   await mkdir(paths.stateDir, { recursive: true, mode: 0o700 });
   await writeFile(paths.configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   await chmod(paths.configPath, 0o600).catch(() => undefined);
@@ -109,6 +144,8 @@ interface BrowserDir {
   hostsDir: string;
   /** Windows: the HKCU key the browser reads native-messaging hosts from. */
   registryKey?: string;
+  /** Linux: a Snap or Flatpak build, by its id (`snap:chromium`), whose manifest points at a relay (relay.ts). */
+  sandbox?: string;
 }
 
 const dir = (name: string, app: string, launchers: string[], defaultIds: string[], dataDir: string): BrowserDir => ({
@@ -131,7 +168,10 @@ function macBrowserDirs(home: string): BrowserDir[] {
     mac('Brave', 'Brave Browser', 'com.brave.Browser', 'BraveSoftware', 'Brave-Browser'),
     mac('Chromium', 'Chromium', 'org.chromium.Chromium', 'Chromium'),
     mac('Microsoft Edge', 'Microsoft Edge', 'com.microsoft.edgemac', 'Microsoft Edge'),
-    mac('Google Chrome for Testing', 'Google Chrome for Testing', 'com.google.chrome.for.testing', 'Google', 'Chrome for Testing')
+    mac('Google Chrome for Testing', 'Google Chrome for Testing', 'com.google.chrome.for.testing', 'Google', 'Chrome for Testing'),
+    // An Electron browser (electron-chrome-extensions): it reads its own
+    // folder and Chrome's, so with Chrome gone it still finds the manifest.
+    mac('jbrow', 'jbrow', 'sk.awantech.jbrow', 'jbrow')
   ];
   // Arc has been seen reading Chrome's folder rather than its own, so with Arc
   // present Chrome's folder gets the manifest too, installed or not.
@@ -141,9 +181,8 @@ function macBrowserDirs(home: string): BrowserDir[] {
 }
 
 /**
- * Linux browsers keep their per-user manifests under the XDG config folder.
- * Snap and Flatpak builds are not here: their sandbox reads another folder and
- * will not start a host outside it.
+ * Linux browsers keep their per-user manifests under the XDG config folder; a
+ * Snap or Flatpak build keeps them under its own folder (sandboxedBrowserDirs).
  */
 function linuxBrowserDirs(home: string): BrowserDir[] {
   const config = home === homedir() && process.env.XDG_CONFIG_HOME ? process.env.XDG_CONFIG_HOME : join(home, '.config');
@@ -162,7 +201,43 @@ function linuxBrowserDirs(home: string): BrowserDir[] {
   const others = chromiumDataDirs(config)
     .filter((d) => !taken.has(d))
     .map((d) => dir(otherBrowserName(relative(config, d)), '', [], [], d));
-  return [...known, ...others];
+  return [...known, ...others, ...sandboxedBrowserDirs(home)];
+}
+
+/**
+ * Snap and Flatpak browsers, by the Chromium user-data folders inside their
+ * own: ~/snap/chromium/common/chromium, ~/snap/brave/current/.config/BraveSoftware/Brave-Browser,
+ * ~/.var/app/com.google.Chrome/config/google-chrome. The same test as for
+ * other browsers, so a sandboxed Electron app is left alone.
+ */
+function sandboxedBrowserDirs(home: string): BrowserDir[] {
+  const names = (d: string): string[] => {
+    try {
+      return readdirSync(d, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+        .map((e) => e.name);
+    } catch {
+      return [];
+    }
+  };
+  const found: BrowserDir[] = [];
+  const add = (app: string, desktopId: string, roots: string[]) => {
+    for (const root of roots) {
+      for (const d of chromiumDataDirs(root)) {
+        const name = sandboxedBrowserName(app, otherBrowserName(relative(root, d)));
+        found.push({ ...dir(name, app, [], [desktopId], d), sandbox: app });
+      }
+    }
+  };
+  for (const n of names(join(home, 'snap'))) {
+    const app = `snap:${n}`;
+    if (sandboxOf(app)) add(app, `${n}_${n}.desktop`, [join(home, 'snap', n, 'common'), join(home, 'snap', n, 'current', '.config')]);
+  }
+  for (const id of names(join(home, '.var', 'app'))) {
+    const app = `flatpak:${id}`;
+    if (sandboxOf(app)) add(app, `${id}.desktop`, [join(home, '.var', 'app', id, 'config')]);
+  }
+  return found;
 }
 
 /** Folder names that do not say the browser's name. */
@@ -270,7 +345,7 @@ export const windowsRegistry = {
 /** The address of a browser's extensions page, by app name, bundle path or executable. */
 export function extensionsPageUrl(app: string): string {
   if (/(^|\/)Arc(\.app)?$/.test(app)) return 'arc://extensions';
-  if (/(^|\/)Microsoft Edge(\.app)?$|microsoft-edge|msedge/.test(app)) return 'edge://extensions';
+  if (/(^|\/)Microsoft Edge(\.app)?$|microsoft-edge|msedge|com\.microsoft\.Edge/.test(app)) return 'edge://extensions';
   return 'chrome://extensions';
 }
 
@@ -300,18 +375,48 @@ export function defaultBrowserId(home = homedir(), platform: NodeJS.Platform = p
   }
 }
 
-/** Where `setupBrowsers` looks for a launcher: Applications folders on a Mac, PATH on Linux; Windows launchers are absolute. */
+/**
+ * Where `setupBrowsers` looks for a launcher: Applications folders on a Mac;
+ * PATH on Linux, and the folders Snap and Flatpak put theirs in; Windows
+ * launchers are absolute.
+ */
 function defaultAppDirs(home: string, platform: NodeJS.Platform): string[] {
   if (platform === 'win32') return [''];
-  if (platform === 'linux') return (process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin').split(':').filter(Boolean);
+  if (platform === 'linux') {
+    const data = home === homedir() && process.env.XDG_DATA_HOME ? process.env.XDG_DATA_HOME : join(home, '.local', 'share');
+    return [
+      ...(process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin').split(':').filter(Boolean),
+      '/snap/bin',
+      join(data, 'flatpak', 'exports', 'bin'),
+      '/var/lib/flatpak/exports/bin'
+    ];
+  }
   return ['/Applications', join(home, 'Applications')];
 }
 
 /**
+ * A sandboxed browser is installed when its launcher is where Snap or Flatpak
+ * puts launchers — not merely a same-named command somewhere on PATH.
+ */
+function sandboxLauncher(app: string, appDirs: string[]): boolean {
+  const s = sandboxOf(app);
+  if (!s) return false;
+  const tail = s.kind === 'snap' ? `${sep}snap${sep}bin` : `${sep}exports${sep}bin`;
+  return appDirs.some((d) => d.replace(/\/+$/, '').endsWith(tail) && existsSync(join(d, s.id)));
+}
+
+/**
+ * Registered, but left out of Set up's steps: Chrome for Testing only the dev
+ * harness drives, and jbrow has no extensions page to type in — it loads an
+ * unpacked folder from its own menu.
+ */
+const NO_SETUP_STEPS = new Set(['Google Chrome for Testing', 'jbrow']);
+
+/**
  * The browsers the user can Load unpacked into, for Set up's steps: used on
  * this computer (a data folder) and still installed (an app bundle, or a
- * command on PATH), the default browser first. Not Chrome for Testing, which
- * only the dev harness drives.
+ * command on PATH), the default browser first, NO_SETUP_STEPS left out. A
+ * sandboxed browser has its own extension folder: it cannot read the shared one.
  */
 export function setupBrowsers(
   home = homedir(),
@@ -321,15 +426,19 @@ export function setupBrowsers(
 ): SetupBrowser[] {
   const isDefault = (d: BrowserDir) => d.defaultIds.some((id) => id.toLowerCase() === defaultId?.toLowerCase());
   return browserDirs(home, platform)
-    .filter((d) => d.name !== 'Google Chrome for Testing' && existsSync(d.dataDir))
+    .filter((d) => !NO_SETUP_STEPS.has(d.name) && existsSync(d.dataDir))
     .flatMap((d) => {
+      if (d.sandbox) return sandboxLauncher(d.sandbox, appDirs) ? [{ d, app: d.sandbox }] : [];
       const launcher = d.launchers.find((l) => appDirs.some((dir) => existsSync(join(dir, l))));
       // On Linux the command that exists is the one to run (on Windows, the
       // executable); a Mac opens the bundle by name.
       return launcher ? [{ d, app: platform === 'darwin' ? d.app : launcher }] : [];
     })
     .sort((a, b) => Number(isDefault(b.d)) - Number(isDefault(a.d)))
-    .map(({ d, app }) => ({ name: d.name, app, extensionsUrl: extensionsPageUrl(app) }));
+    .map(({ d, app }) => {
+      const root = d.sandbox ? sandboxRoot(d.sandbox, home) : null;
+      return { name: d.name, app, extensionsUrl: extensionsPageUrl(app), ...(root ? { extensionPath: join(root, 'extension') } : {}) };
+    });
 }
 
 /** sh-quote: the paths go into a script, and "Application Support" has a space. */
@@ -403,16 +512,84 @@ export interface InstallResult {
   extensionChanged: boolean;
 }
 
-/** Copy the extension when its stamp changed. */
-async function syncExtension(src: InstallSource, paths: BrowserInstallPaths): Promise<boolean> {
+/** Copy the extension to `to` when its stamp changed. */
+async function syncExtension(src: InstallSource, to: string): Promise<boolean> {
   const want = extensionStamp(src.extensionSource);
-  const have = await readFile(join(paths.extensionDir, STAMP_FILE), 'utf8').catch(() => '');
+  const have = await readFile(join(to, STAMP_FILE), 'utf8').catch(() => '');
   if (have.trim() === want) return false;
-  await rm(paths.extensionDir, { recursive: true, force: true });
-  await mkdir(dirname(paths.extensionDir), { recursive: true });
-  await cp(src.extensionSource, paths.extensionDir, { recursive: true });
-  await writeFile(join(paths.extensionDir, STAMP_FILE), `${want}\n`);
+  await rm(to, { recursive: true, force: true });
+  await mkdir(dirname(to), { recursive: true });
+  await cp(src.extensionSource, to, { recursive: true });
+  await writeFile(join(to, STAMP_FILE), `${want}\n`);
   return true;
+}
+
+/**
+ * A sandboxed browser's relay and extension copy, in its own folder; true
+ * when the extension changed. The browser can write there, so everything
+ * happens under the folder held open (relay.ts sandboxDir), and nothing is
+ * written through a name it could have made a link: each file goes to a
+ * fresh name (O_EXCL refuses a link) and is renamed into place, which
+ * replaces a link rather than following it.
+ */
+async function writeRelay(src: InstallSource, paths: BrowserInstallPaths, config: BrowserHostConfig, app: string, home: string): Promise<boolean> {
+  // (A home split across filesystems fails the move below with EXDEV: Set up
+  // then reports the error rather than copying into the browser's reach.)
+  return inSandboxDir(app, home, [], async (root) => {
+    const fresh = (name: string) => join(root.at, `.${name}-${randomBytes(6).toString('hex')}`);
+    const script = relayScript({ port: config.relayPort, token: relayKey(config.relaySecret, app), app, configPath: paths.configPath });
+    const tmp = fresh(RELAY_FILE);
+    await writeFile(tmp, script, { mode: 0o700, flag: 'wx' });
+    await rename(tmp, join(root.at, RELAY_FILE));
+
+    const want = extensionStamp(src.extensionSource);
+    const ext = join(root.at, 'extension');
+    const have = await readFile(join(ext, STAMP_FILE), 'utf8').catch(() => '');
+    if (have.trim() === want) return false;
+    // Built in Stem's own folder, out of the browser's reach, then moved in whole.
+    const staged = join(paths.stateDir, `.extension-${randomBytes(6).toString('hex')}`);
+    await mkdir(paths.stateDir, { recursive: true, mode: 0o700 });
+    await cp(src.extensionSource, staged, { recursive: true });
+    await writeFile(join(staged, STAMP_FILE), `${want}\n`);
+    const copy = fresh('extension');
+    try {
+      await rename(staged, copy);
+    } finally {
+      await rm(staged, { recursive: true, force: true });
+    }
+    await removeInSandbox(root.at, 'extension');
+    await rename(copy, ext);
+    return true;
+  });
+}
+
+const RELAY_FILE = 'stem-browser-host';
+
+/** The relay a sandboxed browser's manifest points at. */
+function relayPath(d: BrowserDir, home: string): string {
+  return join(sandboxRoot(d.sandbox!, home)!, RELAY_FILE);
+}
+
+/** Was this sandboxed browser's relay written for THIS profile? */
+function relayIsHere(d: BrowserDir, paths: BrowserInstallPaths, home: string): boolean {
+  try {
+    const m = JSON.parse(readFileSync(join(d.hostsDir, `${BROWSER_NATIVE_HOST}.json`), 'utf8')) as { path?: unknown };
+    if (m.path !== relayPath(d, home)) return false;
+    return readFileSync(relayPath(d, home), 'utf8').includes(`whose config is ${paths.configPath}\n`);
+  } catch {
+    return false;
+  }
+}
+
+/** The sandboxed browsers whose relay is this profile's: the ones the desktop listens on loopback for. */
+export function relaysHere(paths = browserInstallPaths(), home = homedir(), platform: NodeJS.Platform = process.platform): string[] {
+  if (platform !== 'linux') return [];
+  return [...new Set(browserDirs(home, platform).filter((d) => d.sandbox && relayIsHere(d, paths, home)).map((d) => d.sandbox!))];
+}
+
+/** Does Set up have any sandboxed browser to write a relay for? */
+export function hasSandboxedBrowsers(home = homedir(), platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'linux' && browserDirs(home, platform).some((d) => d.sandbox);
 }
 
 async function writeWrapper(src: InstallSource, paths: BrowserInstallPaths, platform: NodeJS.Platform): Promise<void> {
@@ -431,13 +608,24 @@ export async function installBrowserControl(
   home = homedir(),
   platform: NodeJS.Platform = process.platform
 ): Promise<InstallResult> {
-  await ensureHostConfig(paths);
-  const extensionChanged = await syncExtension(src, paths);
+  const config = await ensureHostConfig(paths);
+  let extensionChanged = await syncExtension(src, paths.extensionDir);
   await writeWrapper(src, paths, platform);
   const manifest = `${JSON.stringify(hostManifest(paths.wrapperPath), null, 2)}\n`;
   const registered: string[] = [];
+  const relays = new Set<string>();
   if (platform === 'win32') await writeFile(paths.manifestPath, manifest);
   for (const d of browserDirs(home, platform)) {
+    if (d.sandbox) {
+      if (!relays.has(d.sandbox)) {
+        relays.add(d.sandbox);
+        if (await writeRelay(src, paths, config, d.sandbox, home)) extensionChanged = true;
+      }
+      await mkdir(d.hostsDir, { recursive: true });
+      await writeFile(join(d.hostsDir, `${BROWSER_NATIVE_HOST}.json`), `${JSON.stringify(hostManifest(relayPath(d, home)), null, 2)}\n`);
+      registered.push(d.name);
+      continue;
+    }
     if (d.registryKey) {
       windowsRegistry.write(`${d.registryKey}\\${BROWSER_NATIVE_HOST}`, paths.manifestPath);
       registered.push(d.name);
@@ -457,6 +645,10 @@ export function installedHere(
   platform: NodeJS.Platform = process.platform
 ): boolean {
   for (const d of browserDirs(home, platform)) {
+    if (d.sandbox) {
+      if (relayIsHere(d, paths, home)) return true;
+      continue;
+    }
     if (d.registryKey) {
       if (windowsRegistry.read(`${d.registryKey}\\${BROWSER_NATIVE_HOST}`)?.toLowerCase() === paths.manifestPath.toLowerCase()) return true;
       continue;
@@ -488,8 +680,14 @@ export async function refreshBrowserControl(
   platform: NodeJS.Platform = process.platform
 ): Promise<{ extensionChanged: boolean } | null> {
   if (!installedHere(paths, home, platform)) return null;
-  const extensionChanged = await syncExtension(src, paths);
+  let extensionChanged = await syncExtension(src, paths.extensionDir);
   await writeWrapper(src, paths, platform);
   if (platform === 'win32') await writeFile(paths.manifestPath, `${JSON.stringify(hostManifest(paths.wrapperPath), null, 2)}\n`);
+  const relays = relaysHere(paths, home, platform);
+  if (relays.length) {
+    // The relay port may have moved since (another program took it).
+    const config = await ensureHostConfig(paths);
+    for (const app of relays) if (await writeRelay(src, paths, config, app, home)) extensionChanged = true;
+  }
   return { extensionChanged };
 }

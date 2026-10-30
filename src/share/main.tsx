@@ -11,7 +11,7 @@ import './viewer.css';
 // server only hands out the encrypted blob (relay/PROTOCOL.md, "Share links").
 
 type State =
-  | { kind: 'loading' }
+  | { kind: 'loading'; got?: number; total?: number }
   | { kind: 'ready'; snap: ShareSnapshot }
   | { kind: 'error'; title: string; detail: string };
 
@@ -23,7 +23,33 @@ function parseLocation(): { id: string; key: string } | null {
   return m && key ? { id: m[1]!, key } : null;
 }
 
-async function load(id: string, key: string): Promise<State> {
+/** The blob, reporting bytes as they arrive: a share with pictures runs to
+ * megabytes, and a bare "Unlocking…" for that long reads as a broken link. */
+async function readBody(res: Response, onProgress: (got: number, total: number) => void): Promise<Uint8Array> {
+  const total = Number(res.headers.get('Content-Length')) || 0;
+  if (!res.body || !total) return new Uint8Array(await res.arrayBuffer());
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    onProgress(got, total);
+  }
+  const out = new Uint8Array(got);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
+const mb = (bytes: number) => (bytes / (1 << 20)).toFixed(1);
+
+async function load(id: string, key: string, onProgress: (got: number, total: number) => void): Promise<State> {
   let res: Response;
   try {
     res = await fetch(`/v1/shares/${id}`, { credentials: 'omit', referrerPolicy: 'no-referrer' });
@@ -40,8 +66,14 @@ async function load(id: string, key: string): Promise<State> {
     return { kind: 'error', title: 'Nothing here', detail: 'The link is wrong, or it expired.' };
   }
   if (!res.ok) return { kind: 'error', title: 'Could not load this page', detail: `The server answered ${res.status}.` };
+  let blob: Uint8Array;
   try {
-    const snap = await openShare(new Uint8Array(await res.arrayBuffer()), key);
+    blob = await readBody(res, onProgress);
+  } catch {
+    return { kind: 'error', title: 'Could not load this page', detail: 'The download stopped. Check your connection and reload.' };
+  }
+  try {
+    const snap = await openShare(blob, key);
     document.title = `${snap.title} · Stem`;
     return { kind: 'ready', snap };
   } catch (e) {
@@ -161,13 +193,27 @@ function Viewer() {
       setState({ kind: 'error', title: 'Nothing here', detail: 'This address is not a shared page.' });
       return;
     }
-    void load(loc.id, loc.key).then(setState);
+    // Progress only matters once it's slow: small shares never show it.
+    const progress = (got: number, total: number) => {
+      if (total >= 512 << 10) setState((s) => (s.kind === 'loading' ? { kind: 'loading', got, total } : s));
+    };
+    void load(loc.id, loc.key, progress).then(setState);
   }, [loc]);
 
   return (
     <div className="viewer">
       <main className="viewer-main">
-        {state.kind === 'loading' && <p className="muted viewer-message">Unlocking…</p>}
+        {state.kind === 'loading' &&
+          (state.total && state.got !== undefined && state.got < state.total ? (
+            <div className="muted viewer-message">
+              <p>
+                Downloading {mb(state.got)} of {mb(state.total)} MB…
+              </p>
+              <progress className="viewer-progress" value={state.got} max={state.total} />
+            </div>
+          ) : (
+            <p className="muted viewer-message">Unlocking…</p>
+          ))}
         {state.kind === 'error' && (
           <div className="viewer-message">
             <h1>{state.title}</h1>

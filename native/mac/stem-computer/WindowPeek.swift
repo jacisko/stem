@@ -22,6 +22,11 @@ enum WindowPeek {
     return ordered.first(where: { $0.frontmost }) ?? ordered.first
   }
 
+  /// A window asked about before, again (the panel's New re-captures it); nil once it is gone.
+  static func window(id: CGWindowID) -> WindowInfo? {
+    Windows.list(minimized: false).first(where: { $0.id == id })
+  }
+
   static func describe(_ w: WindowInfo) -> [String: Any] {
     [
       "windowId": Int(w.id),

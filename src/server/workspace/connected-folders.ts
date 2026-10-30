@@ -24,7 +24,7 @@ function emptyStore(): ConnectedFoldersStore {
 }
 
 function isFolderKind(v: unknown): v is ConnectedFolderKind {
-  return v === 'notes' || v === 'code' || v === 'docs' || v === 'private';
+  return v === 'notes' || v === 'code' || v === 'docs' || v === 'private' || v === 'claude';
 }
 
 /** Coerce one parsed entry into a valid ConnectedFolder, or null to drop it. */

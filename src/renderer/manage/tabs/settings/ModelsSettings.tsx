@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Plug, Plus, X, Check, ChevronRight, TriangleAlert } from 'lucide-react';
+import { Plug, Plus, X, Check, ChevronRight, TriangleAlert, RefreshCw, LogIn, Unplug } from 'lucide-react';
 import type {
+  AppSettings,
   AuthProviderId,
   ApiKeyProviderId,
   ExecSettings,
   WebSearchSettings,
+  DeviceInfo,
   LocalProviderApi,
+  LocalProviderHealth,
   LocalProviderId,
   LocalProvidersSettings,
   LocalProviderTestResult,
@@ -36,7 +39,9 @@ import { RequestGate } from '../../../requestGate';
 import { InfoTip } from '../../../ui/InfoTip';
 import { ModelPicker } from '../../../ui/ModelPicker';
 import type { ModelTabProps } from '../shared';
-import { SettingSection } from './rows';
+import { DisclosureRow, RowSelect, SettingSection, ValueRow } from './rows';
+import { ConfirmDelete, DetailHeader, DetailIdent } from '../../ListDetail';
+import { useRemoteServer } from '../../../hooks/useRemoteServer';
 import { MemoryRecallSection } from './RecallSettings';
 import { ProviderChip } from './ProviderChip';
 import {
@@ -79,12 +84,20 @@ export function ModelsSettings({ models, modelId, onSelectModel, deadProvider, r
     return () => window.removeEventListener('stem:providers-changed', load);
   }, []);
 
+  // An opened provider replaces the tab, the way an editor replaces its list in
+  // Manage: one thing at a time, with a way back.
+  const [openProvider, setOpenProvider] = useState<string | null>(null);
+
   return (
     <div>
-      <ProvidersSection deadProvider={deadProvider} />
-      <ModelRolesSection models={models} modelId={modelId} onSelectModel={onSelectModel} />
-      <MemoryRecallSection focus={recallFocus} />
-      <WebSearchSection providers={providers} />
+      <ProvidersSection deadProvider={deadProvider} selected={openProvider} onSelect={setOpenProvider} />
+      {!openProvider && (
+        <>
+          <ModelRolesSection models={models} modelId={modelId} onSelectModel={onSelectModel} />
+          <MemoryRecallSection focus={recallFocus} />
+          <WebSearchSection providers={providers} />
+        </>
+      )}
     </div>
   );
 }
@@ -745,18 +758,49 @@ function providerKind(id: string): string {
   return 'API key / subscription';
 }
 
+/** The tile's dot: a dead sign-in, or a server whose last check got no answer, is red. */
+function providerTone(id: string, deadProvider: string | null | undefined, health: LocalProviderHealth | undefined): 'ok' | 'bad' | 'unknown' {
+  if (id === deadProvider) return 'bad';
+  if (!isLocalProviderId(id)) return 'ok';
+  if (!health) return 'unknown';
+  return health.state === 'down' ? 'bad' : 'ok';
+}
+
 /**
- * Provider management, mirroring the MCP Servers tab: connected providers as a
- * grouped list with a +/− gutter; the + button opens an Add Provider form with
- * an account / API key / local-server segmented choice. Runs against the same
- * auth IPC as the onboarding wizard.
+ * Provider management: connected providers as tiles, each opening a page of its
+ * own; + opens an Add Provider form with an account / API key / server choice.
+ * Runs against the same auth IPC as the onboarding wizard.
  */
-function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
+function ProvidersSection({
+  deadProvider,
+  selected,
+  onSelect
+}: {
+  deadProvider?: string | null;
+  selected: string | null;
+  onSelect: (id: string | null) => void;
+}) {
   const [providers, setProviders] = useState<string[]>([]);
   const [local, setLocal] = useState<LocalProvidersSettings | null>(null);
+  const [health, setHealth] = useState<Record<string, LocalProviderHealth>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  // The computers a server can run on. The picker only shows when the Stem
+  // server is elsewhere (or a server already runs on one), but the names are
+  // needed either way to say which computer that is.
+  const remote = useRemoteServer();
+  const [hosts, setHosts] = useState<DeviceInfo[]>([]);
+  const [thisDeviceId, setThisDeviceId] = useState<string | null>(null);
+  useEffect(() => {
+    void window.stem
+      .listDevices()
+      .then((snapshot) => setHosts(snapshot.devices.filter((d) => d.kind === 'desktop')))
+      .catch(() => undefined);
+    void window.stem
+      .clientInfo()
+      .then((info) => setThisDeviceId(info.deviceId))
+      .catch(() => undefined);
+  }, [remote]);
   // The Add Provider form is collapsed behind the + button so the steady
   // state is a calm list of connected providers.
   const [adding, setAdding] = useState(false);
@@ -775,14 +819,36 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
     input: { requestId: string; message: string; placeholder?: string } | null;
   } | null>(null);
 
+  // Bumped by every server-fresh settings push, so a refresh that started
+  // before one does not overwrite it with the cached copy it was handed.
+  const freshGen = useRef(0);
   const refresh = useCallback(async () => {
-    const [status, settings] = await Promise.all([window.stem.runtimeStatus(), window.stem.getSettings()]);
+    const gen = freshGen.current;
+    const [status, settings, checks] = await Promise.all([
+      window.stem.runtimeStatus(),
+      window.stem.getSettings(),
+      // quiet: an older server has no health channel; the dots then stay neutral.
+      window.stem.localProviderHealth().catch(() => ({}))
+    ]);
     setProviders(status.providers ?? []);
-    setLocal(settings.localProviders);
+    if (freshGen.current === gen) setLocal(settings.localProviders);
+    setHealth(checks);
   }, []);
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  // A Mac on a remote server answers settings:get from its cache first and
+  // pushes the server's copy when it lands. Without this the tile of a server
+  // just added reads the cached "disabled" and vanishes.
+  useEffect(
+    () =>
+      window.stem.onCacheFresh(({ channel, result }) => {
+        if (channel !== 'settings:get') return;
+        freshGen.current++;
+        setLocal((result as AppSettings).localProviders);
+      }),
+    []
+  );
 
   useEffect(
     () =>
@@ -844,9 +910,24 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
       const res = await window.stem.disconnectProvider(id);
       if (!res.ok) setError(res.error ?? 'Could not disconnect.');
       else {
-        setSelected(null);
+        onSelect(null);
         await changed();
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function checkAgain() {
+    setBusy(true);
+    setError(null);
+    try {
+      setHealth(await window.stem.refreshLocalProviders());
+      await changed();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -859,6 +940,79 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
     ...cloudProviders.map((id) => ({ id, name: providerName(id), detail: providerKind(id) })),
     ...enabledLocals.map((id) => ({ id, name: local![id].name ?? providerName(id), detail: local![id].baseUrl }))
   ];
+
+  // The sign-in in flight, wherever it was started from (Add, or Reconnect on a provider's page).
+  const oauthBlock = (
+    <>
+    {oauth && !oauth.input && (
+      <div className="set-block">
+        <span className="set-sub">Waiting for your browser…</span>
+        <p className="muted">
+          Finish signing in to {providerName(oauth.provider)} in your browser — Stem continues automatically.
+        </p>
+        {oauth.deviceCode && (
+          <p className="muted">
+            Enter code <code className="gate-code">{oauth.deviceCode.userCode}</code> at{' '}
+            {oauth.deviceCode.verificationUri}
+          </p>
+        )}
+        {oauth.authUrl && (
+          <p className="muted">
+            Nothing happened? Open this link yourself: <code className="login-cmd">{oauth.authUrl}</code>
+          </p>
+        )}
+        {oauth.progress && <p className="muted">{oauth.progress}</p>}
+        <div className="push-row">
+          <button className="push" onClick={cancelOAuth}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    )}
+
+    {oauth?.input && (
+      <ProviderManualCode
+        message={oauth.input.message}
+        placeholder={oauth.input.placeholder}
+        onSubmit={(value) => {
+          void window.stem.providerLoginRespond(oauth.input!.requestId, value);
+          setOauth({ ...oauth, input: null });
+        }}
+        onCancel={cancelOAuth}
+      />
+    )}
+    </>
+  );
+
+  const open = selected && !adding ? rows.find((row) => row.id === selected) : undefined;
+  if (open) {
+    const lp = isLocalProviderId(open.id) ? local?.[open.id] : undefined;
+    return (
+      <>
+        <ProviderDetail
+          id={open.id}
+          name={open.name}
+          dead={open.id === deadProvider}
+          local={lp}
+          health={health[open.id]}
+          busy={busy}
+          remote={remote}
+          hosts={hosts}
+          thisDeviceId={thisDeviceId}
+          onBack={() => onSelect(null)}
+          onReconnect={
+            (AUTH_PROVIDER_IDS as string[]).includes(open.id) ? () => void startOAuth(open.id as AuthProviderId) : undefined
+          }
+          onCheck={lp ? () => void checkAgain() : undefined}
+          onDisconnect={() => void disconnect(open.id)}
+          onChanged={changed}
+          onError={setError}
+        />
+        {oauth && <div className="formgroup">{oauthBlock}</div>}
+        {error && <p className="error">{error}</p>}
+      </>
+    );
+  }
 
   return (
     <>
@@ -888,17 +1042,25 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
           <button
             key={row.id}
             type="button"
-            className={`prov-tile${selected === row.id ? ' selected' : ''}`}
-            aria-pressed={selected === row.id}
-            onClick={() => setSelected((cur) => (cur === row.id ? null : row.id))}
+            className="prov-tile"
+            onClick={() => {
+              setAdding(false);
+              onSelect(row.id);
+            }}
           >
             <span className="prov-tile-head">
               <ProviderChip id={row.id} />
-              <span className={`prov-dot ${row.id === deadProvider ? 'bad' : 'ok'}`} />
+              <span className={`prov-dot ${providerTone(row.id, deadProvider, health[row.id])}`} />
             </span>
             <span>
               <b>{row.name}</b>
-              <i>{row.id === deadProvider ? 'Session expired' : row.detail}</i>
+              <i>
+                {row.id === deadProvider
+                  ? 'Session expired'
+                  : health[row.id]?.state === 'down'
+                    ? 'Not answering'
+                    : row.detail}
+              </i>
             </span>
           </button>
         ))}
@@ -907,26 +1069,6 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
           Add provider
         </button>
       </div>
-      {/* Everything there is to DO to one provider, revealed by selecting its
-          tile — the +/− gutter asked people to select first and then find the
-          actions somewhere else. */}
-      {selected && !adding && (
-        <div className="prov-actions">
-          {(AUTH_PROVIDER_IDS as string[]).includes(selected) && (
-            <button
-              className="link-btn"
-              disabled={busy}
-              onClick={() => void startOAuth(selected as AuthProviderId)}
-            >
-              Reconnect
-            </button>
-          )}
-          <button className="link-btn danger" disabled={busy} onClick={() => void disconnect(selected)}>
-            Disconnect
-          </button>
-        </div>
-      )}
-
       {adding && (
         <>
           <div className="grp-head">Add Provider</div>
@@ -962,6 +1104,9 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
                 {mode === 'local' && local && (
                   <LocalServerAddForm
                     settings={local}
+                    remote={remote}
+                    hosts={hosts}
+                    thisDeviceId={thisDeviceId}
                     onSaved={async () => {
                       await changed();
                       closeForm();
@@ -973,64 +1118,189 @@ function ProvidersSection({ deadProvider }: { deadProvider?: string | null }) {
               </>
             )}
 
-            {oauth && !oauth.input && (
-              <div className="set-block">
-                <span className="set-sub">Waiting for your browser…</span>
-                <p className="muted">
-                  Finish signing in to {providerName(oauth.provider)} in your browser — Stem continues automatically.
-                </p>
-                {oauth.deviceCode && (
-                  <p className="muted">
-                    Enter code <code className="gate-code">{oauth.deviceCode.userCode}</code> at{' '}
-                    {oauth.deviceCode.verificationUri}
-                  </p>
-                )}
-                {oauth.authUrl && (
-                  <p className="muted">
-                    Nothing happened? Open this link yourself: <code className="login-cmd">{oauth.authUrl}</code>
-                  </p>
-                )}
-                {oauth.progress && <p className="muted">{oauth.progress}</p>}
-                <div className="push-row">
-                  <button className="push" onClick={cancelOAuth}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {oauth?.input && (
-              <ProviderManualCode
-                message={oauth.input.message}
-                placeholder={oauth.input.placeholder}
-                onSubmit={(value) => {
-                  void window.stem.providerLoginRespond(oauth.input!.requestId, value);
-                  setOauth({ ...oauth, input: null });
-                }}
-                onCancel={cancelOAuth}
-              />
-            )}
+            {oauthBlock}
           </div>
         </>
       )}
 
-      {/* Revealed by selecting the row, the way Add Provider is revealed by +.
-          Only for a connected custom endpoint: Ollama reports its own
-          capabilities, and LM Studio's users are better served by adding their
-          server as a custom endpoint than by a second place to hand-configure. */}
-      {selected && isCustomProviderId(selected) && local?.[selected]?.enabled && !adding && (
-        <CustomOverridesForm
-          providerId={selected}
-          providerName={local[selected].name ?? providerName(selected)}
-          value={local[selected].modelOverrides}
-          busy={busy}
-          onSaved={changed}
-          onError={setError}
-        />
-      )}
-
       {error && <p className="error">{error}</p>}
     </>
+  );
+}
+
+/**
+ * Where a model server runs: on the Stem server, or on a paired computer that
+ * reaches it on its own network. Only offered when the Stem server is somewhere
+ * else — on one machine both answers are the same place.
+ */
+function runsOnOptions(
+  hosts: DeviceInfo[],
+  thisDeviceId: string | null,
+  current: string
+): { value: string; label: string }[] {
+  const options = [
+    { value: '', label: 'On your Stem server' },
+    ...hosts.map((h) => ({ value: h.id, label: h.id === thisDeviceId ? 'On this computer' : `On ${h.label}` }))
+  ];
+  // A computer that was unpaired still shows, so the row says the truth.
+  if (current && !options.some((o) => o.value === current)) {
+    options.push({ value: current, label: 'On a computer that is no longer paired' });
+  }
+  return options;
+}
+
+/** "3 minutes ago" for a check's timestamp. */
+function checkedAgo(at: number): string {
+  const s = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`;
+  const h = Math.round(m / 60);
+  return `${h} hour${h === 1 ? '' : 's'} ago`;
+}
+
+/** One provider's page: what it is, whether it answers, where it runs, and what can be done to it. */
+function ProviderDetail({
+  id,
+  name,
+  dead,
+  local,
+  health,
+  busy,
+  remote,
+  hosts,
+  thisDeviceId,
+  onBack,
+  onReconnect,
+  onCheck,
+  onDisconnect,
+  onChanged,
+  onError
+}: {
+  id: string;
+  name: string;
+  dead: boolean;
+  local: LocalProvidersSettings[LocalProviderId] | undefined;
+  health: LocalProviderHealth | undefined;
+  busy: boolean;
+  remote: boolean;
+  hosts: DeviceInfo[];
+  thisDeviceId: string | null;
+  onBack: () => void;
+  onReconnect?: () => void;
+  onCheck?: () => void;
+  onDisconnect: () => void;
+  onChanged: () => Promise<void>;
+  onError: (message: string | null) => void;
+}) {
+  const [moving, setMoving] = useState(false);
+  const where = local?.location?.deviceId ?? '';
+
+  async function move(deviceId: string) {
+    setMoving(true);
+    onError(null);
+    try {
+      const res = await window.stem.updateLocalProvider(id as LocalProviderId, {
+        location: deviceId ? { deviceId } : null
+      });
+      if (!res.ok) onError(res.error ?? 'Could not move the server.');
+      else await onChanged();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMoving(false);
+    }
+  }
+
+  let status: { tone: 'ok' | 'bad' | 'unknown'; text: string; hint?: string };
+  if (dead) status = { tone: 'bad', text: 'Session expired', hint: 'Chats on it fail until you reconnect.' };
+  else if (!local) status = { tone: 'ok', text: 'Signed in' };
+  else if (!health) status = { tone: 'unknown', text: 'Not checked yet' };
+  else if (health.state === 'manual') status = { tone: 'ok', text: 'Models entered by hand', hint: 'Stem does not check this server.' };
+  else if (health.state === 'ok') {
+    status = {
+      tone: 'ok',
+      text: 'Answering',
+      hint: `${health.models.length} model${health.models.length === 1 ? '' : 's'} · checked ${checkedAgo(health.checkedAt)}`
+    };
+  } else {
+    status = {
+      tone: 'bad',
+      text: 'Not answering',
+      hint:
+        `${health.error ?? 'The server did not answer.'}` +
+        (health.models.length ? ` Showing the models it listed last time.` : '') +
+        ` Checked ${checkedAgo(health.checkedAt)}.`
+    };
+  }
+  const models = health?.models ?? local?.models ?? [];
+
+  return (
+    <div className="prov-detail">
+      <DetailHeader backLabel="Models" onBack={onBack}>
+        {busy || moving ? (
+          <span className="muted">{moving ? 'Moving…' : 'Working…'}</span>
+        ) : (
+          <>
+            {onCheck && (
+              <button type="button" className="icon-action sm" title="Check again" aria-label="Check again" onClick={onCheck}>
+                <RefreshCw size={14} />
+              </button>
+            )}
+            {onReconnect && (
+              <button type="button" className="icon-action sm" title="Reconnect" aria-label="Reconnect" onClick={onReconnect}>
+                <LogIn size={14} />
+              </button>
+            )}
+            <ConfirmDelete label="Disconnect" icon={<Unplug size={14} />} onConfirm={onDisconnect} />
+          </>
+        )}
+      </DetailHeader>
+      <DetailIdent glyph={<ProviderChip id={id} />} name={<strong>{name}</strong>} caption={providerKind(id)} />
+
+      <div className="group">
+        <ValueRow label="Status" hint={status.hint}>
+          <span className="vval">
+            <span className={`prov-dot ${status.tone}`} /> {status.text}
+          </span>
+        </ValueRow>
+        {/* The URL as the second line: the panel is too narrow to share a row with it. */}
+        {local && <ValueRow label="Address" hint={<span className="mono">{local.baseUrl}</span>} />}
+        {local && (remote || where) && (
+          <ValueRow label="Runs on" hint={where ? 'Reached through that computer while it is awake' : undefined}>
+            <RowSelect
+              ariaLabel="Computer this server runs on"
+              value={where}
+              options={runsOnOptions(hosts, thisDeviceId, where)}
+              onChange={(v) => void move(v)}
+            />
+          </ValueRow>
+        )}
+        {local && models.length > 0 && (
+          <DisclosureRow label="Models" value={String(models.length)}>
+            {models.map((m) => (
+              <span key={m} className="mono">
+                {m}
+              </span>
+            ))}
+          </DisclosureRow>
+        )}
+      </div>
+
+      {/* Ollama reports its own capabilities, and LM Studio's users are better
+          served by adding their server as a custom endpoint than by a second
+          place to hand-configure. */}
+      {local && isCustomProviderId(id) && (
+        <CustomOverridesForm
+          providerId={id as LocalProviderId}
+          providerName={name}
+          value={local.modelOverrides}
+          busy={busy}
+          onSaved={onChanged}
+          onError={onError}
+        />
+      )}
+    </div>
   );
 }
 
@@ -1420,8 +1690,8 @@ function CustomOverridesForm({
 /**
  * Add an OpenAI-compatible server (Ollama / LM Studio / a custom endpoint): pick
  * the server, adjust the URL if needed, optionally Test, then Enable. Editing
- * later = disconnect (−) and re-add, matching the MCP servers list — except for
- * the per-model overrides, which are editable in place on the connected row.
+ * later = disconnect and re-add, except for where it runs and the per-model
+ * overrides, which are editable on the provider's page.
  *
  * The custom endpoint adds a key field and an optional typed model list. Left
  * empty, the endpoint is discovered like Ollama and LM Studio are: the sync
@@ -1437,16 +1707,30 @@ function CustomOverridesForm({
  */
 function LocalServerAddForm({
   settings,
+  remote,
+  hosts,
+  thisDeviceId,
   onSaved,
   onError,
   onCancel
 }: {
   settings: LocalProvidersSettings;
+  remote: boolean;
+  hosts: DeviceInfo[];
+  thisDeviceId: string | null;
   onSaved: () => Promise<void>;
   onError: (message: string | null) => void;
   onCancel: () => void;
 }) {
   const [server, setServer] = useState<LocalProviderId>('ollama');
+  // Where the server runs. With the Stem server elsewhere, Ollama and LM Studio
+  // are almost always on the computer you are sitting at, so that is the
+  // default — until it is changed by hand.
+  const [where, setWhere] = useState('');
+  const whereTouched = useRef(false);
+  useEffect(() => {
+    if (remote && thisDeviceId && !whereTouched.current) setWhere(thisDeviceId);
+  }, [remote, thisDeviceId]);
   const [baseUrl, setBaseUrl] = useState(settings.ollama.baseUrl);
   const [apiKey, setApiKey] = useState('');
   const [models, setModels] = useState('');
@@ -1548,7 +1832,8 @@ function LocalServerAddForm({
         tested.server,
         tested.baseUrl,
         custom ? tested.apiKey : undefined,
-        probeApi
+        probeApi,
+        where || null
       );
       if (speaksForTheForm()) {
         setTest(result);
@@ -1588,7 +1873,9 @@ function LocalServerAddForm({
         // Whatever the box holds, including an emptied one — Enable is the point
         // where retained overrides are either confirmed for this endpoint or
         // cleared. Malformed JSON can't get here: the button is disabled.
-        ...(custom && parsedOverrides.ok ? { modelOverrides: parsedOverrides.value } : {})
+        ...(custom && parsedOverrides.ok ? { modelOverrides: parsedOverrides.value } : {}),
+        // Always sent, so re-adding a server that used to run elsewhere lands where the form says.
+        location: where ? { deviceId: where } : null
       });
       if (!res.ok) onError(res.error ?? 'Could not enable the server.');
       else await onSaved();
@@ -1640,6 +1927,26 @@ function LocalServerAddForm({
           </option>
         ))}
       </select>
+      {remote && (
+        <select
+          className="ifield"
+          aria-label="Computer this server runs on"
+          value={where}
+          onChange={(e) => {
+            whereTouched.current = true;
+            testGateRef.current.invalidate();
+            setWhere(e.target.value);
+            setTest(null);
+            setTesting(false);
+          }}
+        >
+          {runsOnOptions(hosts, thisDeviceId, where).map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      )}
       <input
         className="ifield"
         aria-label={`${providerName(server)} base URL`}

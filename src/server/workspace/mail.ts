@@ -12,6 +12,7 @@ import {
   type MailAgent,
   type MailConversation,
   type MailExternal,
+  type MailCollab,
   type MailExternalThread,
   type MailItem,
   type MailListResult,
@@ -148,7 +149,9 @@ function coerceItem(raw: unknown): MailItem | null {
           kind,
           ...(typeof att.name === 'string' ? { name: att.name } : {}),
           ...(typeof att.mime === 'string' ? { mime: att.mime } : {}),
-          ...(typeof att.dataUrl === 'string' ? { dataUrl: att.dataUrl } : {})
+          ...(typeof att.dataUrl === 'string' ? { dataUrl: att.dataUrl } : {}),
+          ...(typeof att.fileId === 'string' && /^[0-9a-f]{32}$/.test(att.fileId) ? { fileId: att.fileId } : {}),
+          ...(num(att.size) !== undefined ? { size: num(att.size) } : {})
         }
       ];
     });
@@ -157,7 +160,7 @@ function coerceItem(raw: unknown): MailItem | null {
   return item;
 }
 
-const EXTERNAL_STATUSES = ['queued', 'sent', 'delivered', 'expired', 'failed', 'unreachable', 'key-changed'] as const;
+const EXTERNAL_STATUSES = ['queued', 'sent', 'delivered', 'expired', 'failed', 'unreachable', 'key-changed', 'waiting', 'joined'] as const;
 
 function coerceExternal(raw: unknown): MailExternal | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
@@ -170,6 +173,30 @@ function coerceExternal(raw: unknown): MailExternal | undefined {
   if (EXTERNAL_STATUSES.includes(r.status as (typeof EXTERNAL_STATUSES)[number])) out.status = r.status as MailExternal['status'];
   if (typeof r.error === 'string' && r.error) out.error = r.error;
   return out;
+}
+
+function coerceCollab(raw: unknown): MailCollab | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.goal !== 'string' || typeof r.basedOn !== 'string') return undefined;
+  const lines = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, 8) : []);
+  return {
+    goal: r.goal,
+    agreed: lines(r.agreed),
+    open: lines(r.open),
+    ...(typeof r.next === 'string' && r.next ? { next: r.next } : {}),
+    basedOn: r.basedOn,
+    updatedAt: num(r.updatedAt) ?? 0
+  };
+}
+
+/** Store where a conversation with another person stands (interstem/collab.ts). */
+export function setConversationCollab(id: string, collab: MailCollab): Promise<MailListResult> {
+  return update((store) => {
+    const conversation = store.conversations.find((c) => c.id === id);
+    if (!conversation?.external) return false;
+    conversation.collab = collab;
+  });
 }
 
 function coerceExternalThread(raw: unknown): MailExternalThread | undefined {
@@ -239,6 +266,10 @@ function coerceConversation(raw: unknown): MailConversation | null {
     ...(r.private === true ? { private: true as const } : {}),
     ...(r.owner === 'memory-check' ? { owner: 'memory-check' as const } : {}),
     ...(external ? { external } : {}),
+    ...(coerceCollab(r.collab) ? { collab: coerceCollab(r.collab)! } : {}),
+    ...(r.outside && typeof r.outside === 'object' && isExternalAddress(String((r.outside as { address?: unknown }).address ?? ''))
+      ? { outside: { address: String((r.outside as { address: string }).address) } }
+      : {}),
     status,
     exchangeCount: num(r.exchangeCount) ?? 0,
     sendCounts,
@@ -515,7 +546,7 @@ export function createConversation(
   subject: string,
   participants: string[],
   bodyForSubject = '',
-  opts: { private?: boolean; owner?: MailConversation['owner']; external?: MailExternalThread } = {}
+  opts: { private?: boolean; owner?: MailConversation['owner']; external?: MailExternalThread; outside?: { address: string } } = {}
 ): Promise<MailConversation> {
   const conversation: MailConversation = {
     id: randomUUID(),
@@ -525,6 +556,7 @@ export function createConversation(
     ...(opts.private ? { private: true as const } : {}),
     ...(opts.owner ? { owner: opts.owner } : {}),
     ...(opts.external ? { external: opts.external } : {}),
+    ...(opts.outside ? { outside: opts.outside } : {}),
     status: 'idle',
     exchangeCount: 0,
     sendCounts: {},
@@ -1019,19 +1051,22 @@ export async function mailedImageThread(threadId: string, imageId: string): Prom
 }
 
 /** Delete a conversation + its items + triage state. Returns the orphaned thread ids. */
-export async function deleteConversation(id: string): Promise<{ result: MailListResult; threadIds: string[] }> {
+export async function deleteConversation(id: string): Promise<{ result: MailListResult; threadIds: string[]; fileIds: string[] }> {
   let threadIds: string[] = [];
+  let fileIds: string[] = [];
   liveWorking.delete(id);
   const result = await update((store) => {
     const conversation = store.conversations.find((c) => c.id === id);
     threadIds = conversation ? Object.values(conversation.sessions) : [];
     // A scheduled run's thread goes with the mail that kept it.
     for (const item of store.items) if (item.conversationId === id && item.runThreadId) threadIds.push(item.runThreadId);
+    // Files in mail with another person (interstem/mail-files.ts) go too.
+    fileIds = store.items.flatMap((i) => (i.conversationId === id ? (i.attachments ?? []).flatMap((a) => (a.fileId ? [a.fileId] : [])) : []));
     store.conversations = store.conversations.filter((c) => c.id !== id);
     store.items = store.items.filter((i) => i.conversationId !== id);
     delete store.inbox.entries[id];
   });
-  return { result, threadIds };
+  return { result, threadIds, fileIds };
 }
 
 // ---- triage (read / archive / snooze), keyed by conversation id ----

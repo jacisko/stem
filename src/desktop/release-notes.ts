@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { host } from '../server/host';
+import { compareVersions } from '../shared/versions';
 import type { ReleaseNoteEntry, ReleaseNotesSnapshot } from '../shared/types';
 import { readClientSettings, updateClientReleaseNotes } from './settings';
 
@@ -24,16 +25,7 @@ import { readClientSettings, updateClientReleaseNotes } from './settings';
 /** A heading like `## 0.3.0 — 2026-07-29`, `## v0.3.0 - Unreleased`, `## 0.3.0`. */
 const HEADING = /^##\s+v?(\d+(?:\.\d+)*)\s*(?:[—–-]\s*(.*))?$/;
 
-/** Compare dotted numeric versions; missing segments count as 0. */
-export function compareVersions(a: string, b: string): number {
-  const pa = a.split('.').map((n) => Number.parseInt(n, 10) || 0);
-  const pb = b.split('.').map((n) => Number.parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d !== 0) return d < 0 ? -1 : 1;
-  }
-  return 0;
-}
+export { compareVersions };
 
 /**
  * Split RELEASE_NOTES.md into its version sections, newest first (i.e. the file

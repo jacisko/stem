@@ -17,6 +17,10 @@ import type { BrowserAction } from './types';
 // relaying a result — it runs as the browser's child, so macOS attributes that
 // read to the browser rather than asking the user to let Stem into Downloads.
 //
+// A Snap or Flatpak browser cannot run that host; a bash relay inside its
+// sandbox takes its place over loopback TCP (browser-host/relay.ts), and the
+// desktop does the download copy itself.
+//
 // The extension source (src/browser-extension/) is plain JS and cannot import
 // this file; keep the two in step by hand. Bump BROWSER_PROTOCOL when a change
 // is not backward compatible.
@@ -33,7 +37,7 @@ export const BROWSER_NATIVE_HOST = 'com.stem.browser';
  * program must not get Stem to run it. System folders only, so a same-named
  * file in the user's home never qualifies. AppImages live wherever the user put
  * them and are checked on the desktop side (browser-host/appimage.ts). Snap and
- * Flatpak are not here (their sandbox will not start Stem's host anyway).
+ * Flatpak builds are SANDBOXED_BROWSERS below.
  */
 const LINUX_BROWSERS: { name: string; exe: RegExp }[] = [
   { name: 'Google Chrome', exe: /^\/opt\/google\/chrome(-beta|-unstable)?\/chrome$/ },
@@ -60,6 +64,48 @@ export function appImageName(path: string): string {
   return words.join(' ') || 'Browser';
 }
 
+/**
+ * Browsers packaged as a Snap or a Flatpak, by their snap name or Flatpak app
+ * id. Their sandbox will not run Stem's native host, so Set up puts a small
+ * relay inside it (browser-host/relay.ts) that reaches Stem over loopback TCP.
+ * Such a browser is known to Stem as `snap:<name>` or `flatpak:<id>`, and only
+ * the ones listed here are ever started; another sandboxed Chromium still
+ * connects, under the name of its folder.
+ */
+export const SANDBOXED_BROWSERS: Record<string, string> = {
+  'snap:chromium': 'Chromium',
+  'snap:brave': 'Brave',
+  'snap:opera': 'Opera',
+  'snap:opera-beta': 'Opera Beta',
+  'snap:vivaldi': 'Vivaldi',
+  'flatpak:com.google.Chrome': 'Google Chrome',
+  'flatpak:com.google.ChromeDev': 'Google Chrome Dev',
+  'flatpak:org.chromium.Chromium': 'Chromium',
+  'flatpak:io.github.ungoogled_software.ungoogled_chromium': 'Ungoogled Chromium',
+  'flatpak:com.brave.Browser': 'Brave',
+  'flatpak:com.microsoft.Edge': 'Microsoft Edge',
+  'flatpak:com.vivaldi.Vivaldi': 'Vivaldi',
+  'flatpak:com.opera.Opera': 'Opera',
+  'flatpak:ru.yandex.Browser': 'Yandex Browser'
+};
+
+/** A sandboxed browser's id, split: `snap:chromium` → snap, chromium. Null for anything else. */
+export function sandboxOf(app: string): { kind: 'snap' | 'flatpak'; id: string } | null {
+  const snap = /^snap:([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)$/.exec(app);
+  if (snap) return { kind: 'snap', id: snap[1]! };
+  // Flatpak ids are reverse-DNS: at least three parts.
+  const flatpak = /^flatpak:([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*){2,})$/.exec(app);
+  if (flatpak && flatpak[1]!.length <= 255) return { kind: 'flatpak', id: flatpak[1]! };
+  return null;
+}
+
+/** "Chromium (Snap)", "Google Chrome (Flatpak)": the packaging says which of two same-named browsers it is. */
+export function sandboxedBrowserName(app: string, fallback: string): string {
+  const s = sandboxOf(app);
+  if (!s) return fallback;
+  return `${SANDBOXED_BROWSERS[app] ?? fallback} (${s.kind === 'snap' ? 'Snap' : 'Flatpak'})`;
+}
+
 /** The commands Set up may hand the extensions page to on Linux (found on PATH). */
 export const LINUX_BROWSER_COMMANDS = [
   'google-chrome',
@@ -77,9 +123,9 @@ export function linuxBrowserName(exe: string): string | null {
   return LINUX_BROWSERS.find((b) => b.exe.test(exe))?.name ?? null;
 }
 
-/** Is this something Stem may start on Linux: a known browser binary, or one of the known commands? */
+/** Is this something Stem may start on Linux: a known browser binary, one of the known commands, or a known Snap or Flatpak? */
 export function launchableOnLinux(app: string): boolean {
-  return linuxBrowserName(app) !== null || LINUX_BROWSER_COMMANDS.includes(app);
+  return linuxBrowserName(app) !== null || LINUX_BROWSER_COMMANDS.includes(app) || Object.hasOwn(SANDBOXED_BROWSERS, app);
 }
 
 /**
@@ -151,6 +197,8 @@ export type ToExtension =
   | { type: 'end'; threadId: string }
   /** The extension's files on disk changed (a Stem update): reload to pick them up. */
   | { type: 'reload' }
+  /** The user removed this profile in Stem's settings: take the extension out of it. Older extensions ignore it. */
+  | { type: 'uninstall' }
   /** "Ask about this window": answer with the page in front (ExtensionResult.page). Older extensions ignore it. */
   | { type: 'peek'; id: string }
   /** What Stem calls this browser profile ("Work", "Arc 2"), for the popup. */

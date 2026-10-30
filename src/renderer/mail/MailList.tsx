@@ -142,6 +142,18 @@ export function MailList(props: MailListProps) {
     return mailPreviewText((best ?? bestUser)?.body ?? '');
   };
 
+  /** Mail with another person: whose move it is, by who wrote last. */
+  const turnOf = (c: MailConversation): 'you' | 'them' | null => {
+    const address = c.external?.address;
+    if (!address) return null;
+    let last: { at: number; from: string } | null = null;
+    for (const item of mail.items) {
+      if (item.conversationId !== c.id || (item.from !== address && !(item.from === 'user' && item.to.includes(address)))) continue;
+      if (!last || item.at > last.at) last = item;
+    }
+    return !last ? null : last.from === address ? 'you' : 'them';
+  };
+
   const fromLabel = (ids: string[]): string => [...new Set(ids.map((p) => personaName(personas, p)))].join(', ');
 
   /** The latest step of a working conversation: the newest persona-to-persona mail, if any. */
@@ -186,7 +198,8 @@ export function MailList(props: MailListProps) {
         </span>
         <span className="row-main">
           <span className="mail-from">
-            {c.external ? c.external.address : fromLabel(c.participants)}
+            {c.external ? interStem.contact(c.external.address)?.name ?? c.external.address : fromLabel(c.participants)}
+            {c.external && turnOf(c) === 'you' && <em className="mail-needs-you">your turn</em>}
             {c.status === 'awaiting-user' && <em className="mail-needs-you">needs you</em>}
             {c.status === 'failed' && <em className="mail-failed">failed</em>}
             {c.status === 'aborted' && <em className="mail-aborted"> · stopped</em>}
@@ -292,7 +305,7 @@ export function MailList(props: MailListProps) {
       </span>
       <span className="row-main">
         <span className="mail-from">
-          Draft{draft.to.length ? ` · to ${fromLabel(draft.to)}` : ''}
+          Draft{draft.outTo !== undefined ? (draft.outTo ? ` · to ${draft.outTo}` : '') : draft.to.length ? ` · to ${fromLabel(draft.to)}` : ''}
         </span>
         <strong title={draft.subject}>{draft.subject.trim() || '(no subject yet)'}</strong>
         <span className="chat-preview">{mailPreviewText(draft.body)}</span>
