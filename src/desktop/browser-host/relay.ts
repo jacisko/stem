@@ -173,11 +173,20 @@ export async function sandboxDir(app: string, home: string, ...sub: string[]): P
   if (!b) throw new Error(`${app} is not a sandboxed browser`);
   // snapd makes `common` itself; created here only when it has not yet.
   await mkdir(b.base, { recursive: true, mode: 0o700 });
-  let real = await realpath(b.base);
+  return folderUnder(b.base, [...b.below, ...sub]);
+}
+
+/**
+ * Open `parts` below `base`, a folder the browser cannot replace, the way
+ * sandboxDir does: one part at a time through the open folder above it,
+ * created as needed, refusing a link or a folder not this user's.
+ */
+export async function folderUnder(base: string, parts: string[]): Promise<SandboxDir> {
+  let real = await realpath(base);
   let handle = await open(real, constants.O_RDONLY | constants.O_DIRECTORY);
   const uid = process.getuid?.();
   try {
-    for (const part of [...b.below, ...sub]) {
+    for (const part of parts) {
       const parent = PROC_FD ? `/proc/self/fd/${handle.fd}` : real;
       const path = join(parent, part);
       await mkdir(path, { mode: 0o700 }).catch((e: NodeJS.ErrnoException) => {

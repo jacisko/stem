@@ -290,6 +290,29 @@ describe('Snap and Flatpak', () => {
     expect(readFileSync(join(root, 'extension', 'background.js'), 'utf8')).toBe('// v2');
   });
 
+  it.skipIf(process.platform === 'win32')('never writes the host manifest through a link the sandboxed browser planted', async () => {
+    const data = browserData('snap', 'chromium', 'common', 'chromium');
+    const hosts = join(data, 'NativeMessagingHosts');
+    mkdirSync(hosts);
+    const victim = join(home, 'victim.txt');
+    writeFileSync(victim, 'KEEP');
+    // The manifest file as a link: replaced, not written through.
+    symlinkSync(victim, join(hosts, 'com.stem.browser.json'));
+    await installBrowserControl(src(), browserInstallPaths(state), home, 'linux');
+    expect(readFileSync(victim, 'utf8')).toBe('KEEP');
+    expect(JSON.parse(readFileSync(join(hosts, 'com.stem.browser.json'), 'utf8')).path).toBe(
+      join(home, 'snap', 'chromium', 'common', 'stem', 'stem-browser-host')
+    );
+
+    // The folder as a link: refused.
+    rmSync(hosts, { recursive: true });
+    const elsewhere = join(home, 'elsewhere');
+    mkdirSync(elsewhere);
+    symlinkSync(elsewhere, hosts);
+    await expect(installBrowserControl(src(), browserInstallPaths(state), home, 'linux')).rejects.toThrow(/not a folder of this user/);
+    expect(existsSync(join(elsewhere, 'com.stem.browser.json'))).toBe(false);
+  });
+
   it.skipIf(process.platform === 'win32')('never writes through a link the sandboxed browser planted in its folder', async () => {
     browserData('snap', 'chromium', 'common', 'chromium');
     const target = join(home, 'precious');

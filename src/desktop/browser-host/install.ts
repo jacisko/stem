@@ -7,7 +7,7 @@ import { dirname, join, relative, sep } from 'node:path';
 import { host } from '../../server/host';
 import { BROWSER_EXTENSION_ID, BROWSER_NATIVE_HOST, sandboxOf, sandboxedBrowserName } from '../../shared/browser-native';
 import type { SetupBrowser } from '../../shared/types';
-import { inSandboxDir, relayKey, removeInSandbox, relayScript, sandboxRoot } from './relay';
+import { folderUnder, inSandboxDir, relayKey, removeInSandbox, relayScript, sandboxRoot } from './relay';
 
 // Putting the Stem extension within reach of the user's browsers: the files to
 // Load unpacked, the native-messaging host the extension talks to, and the
@@ -146,6 +146,8 @@ interface BrowserDir {
   registryKey?: string;
   /** Linux: a Snap or Flatpak build, by its id (`snap:chromium`), whose manifest points at a relay (relay.ts). */
   sandbox?: string;
+  /** With `sandbox`: the folder above the browser's reach that `hostsDir` is written under. */
+  sandboxBase?: string;
 }
 
 const dir = (name: string, app: string, launchers: string[], defaultIds: string[], dataDir: string): BrowserDir => ({
@@ -221,21 +223,25 @@ function sandboxedBrowserDirs(home: string): BrowserDir[] {
     }
   };
   const found: BrowserDir[] = [];
-  const add = (app: string, desktopId: string, roots: string[]) => {
-    for (const root of roots) {
+  // Each root with the folder above it that the browser cannot replace (the
+  // manifest is written down from there, writeSandboxManifest).
+  const add = (app: string, desktopId: string, roots: [base: string, root: string][]) => {
+    for (const [base, root] of roots) {
       for (const d of chromiumDataDirs(root)) {
         const name = sandboxedBrowserName(app, otherBrowserName(relative(root, d)));
-        found.push({ ...dir(name, app, [], [desktopId], d), sandbox: app });
+        found.push({ ...dir(name, app, [], [desktopId], d), sandbox: app, sandboxBase: base });
       }
     }
   };
   for (const n of names(join(home, 'snap'))) {
     const app = `snap:${n}`;
-    if (sandboxOf(app)) add(app, `${n}_${n}.desktop`, [join(home, 'snap', n, 'common'), join(home, 'snap', n, 'current', '.config')]);
+    const snap = join(home, 'snap', n);
+    if (sandboxOf(app)) add(app, `${n}_${n}.desktop`, [[join(snap, 'common'), join(snap, 'common')], [join(snap, 'current'), join(snap, 'current', '.config')]]);
   }
   for (const id of names(join(home, '.var', 'app'))) {
     const app = `flatpak:${id}`;
-    if (sandboxOf(app)) add(app, `${id}.desktop`, [join(home, '.var', 'app', id, 'config')]);
+    const appDir = join(home, '.var', 'app', id);
+    if (sandboxOf(app)) add(app, `${id}.desktop`, [[appDir, join(appDir, 'config')]]);
   }
   return found;
 }
@@ -563,6 +569,25 @@ async function writeRelay(src: InstallSource, paths: BrowserInstallPaths, config
   });
 }
 
+/**
+ * A sandboxed browser's host manifest. The browser can write its own
+ * NativeMessagingHosts folder, so it could leave a link there for Stem to
+ * write through: the folders are opened from `sandboxBase` refusing links,
+ * and the file goes to a fresh name and is renamed into place, as in writeRelay.
+ */
+async function writeSandboxManifest(d: BrowserDir, manifest: string): Promise<void> {
+  const parts = relative(d.sandboxBase!, d.hostsDir).split(sep);
+  if (parts.some((p) => !p || p === '..')) throw new Error(`${d.hostsDir} is not under ${d.sandboxBase}`);
+  const folder = await folderUnder(d.sandboxBase!, parts);
+  try {
+    const tmp = join(folder.at, `.${BROWSER_NATIVE_HOST}-${randomBytes(6).toString('hex')}`);
+    await writeFile(tmp, manifest, { flag: 'wx' });
+    await rename(tmp, join(folder.at, `${BROWSER_NATIVE_HOST}.json`));
+  } finally {
+    await folder.close();
+  }
+}
+
 const RELAY_FILE = 'stem-browser-host';
 
 /** The relay a sandboxed browser's manifest points at. */
@@ -621,8 +646,7 @@ export async function installBrowserControl(
         relays.add(d.sandbox);
         if (await writeRelay(src, paths, config, d.sandbox, home)) extensionChanged = true;
       }
-      await mkdir(d.hostsDir, { recursive: true });
-      await writeFile(join(d.hostsDir, `${BROWSER_NATIVE_HOST}.json`), `${JSON.stringify(hostManifest(relayPath(d, home)), null, 2)}\n`);
+      await writeSandboxManifest(d, `${JSON.stringify(hostManifest(relayPath(d, home)), null, 2)}\n`);
       registered.push(d.name);
       continue;
     }
